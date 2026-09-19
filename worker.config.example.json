@@ -1,0 +1,12 @@
+{
+  "boardUrl": "http://192.0.2.10:4781",
+  "id": "worker-one",
+  "tokenEnv": "SWITCHBOARD_WORKER_TOKEN",
+  "agents": [
+    "claude",
+    "codex"
+  ],
+  "projects": {
+    "remote-smoke": "C:\\DEV\\Switchboard-Smoke"
+  }
+}
