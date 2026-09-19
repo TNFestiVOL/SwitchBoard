@@ -26,6 +26,13 @@ const resultSchema = z.object({
   ok: z.boolean(), timedOut: z.boolean(), exitCode: z.number().int().nullable(),
   outputTail: z.string().max(20_000), inputTokens: z.number().nonnegative().finite(),
   outputTokens: z.number().nonnegative().finite(), costEstimate: z.number().nonnegative().finite(),
+  headSha: z.string().regex(/^[0-9a-fA-F]{7,64}$/).optional(),
+  dirtyFiles: z.number().int().nonnegative().optional(),
+});
+const exitedSchema = z.object({
+  exitedAt: z.string().datetime({ offset: true }).optional(),
+  exitCode: z.number().int().nullable().optional(),
+  note: z.string().max(2000).optional(),
 });
 const equal = (a: string, b: string) => {
   const left = Buffer.from(a), right = Buffer.from(b);
@@ -49,6 +56,7 @@ export class RemoteCoordinator {
     this.app.post('/workers/:worker/claim', (req, res) => {
       if (!this.authenticate(req.params.worker, req.headers.authorization)) { res.sendStatus(401); return; }
       const parsed = claimSchema.safeParse(req.body);
+      this.store.touchWorker(req.params.worker, 'claim', this.now(), parsed.success ? parsed.data : undefined);
       if (!parsed.success) { res.status(400).json({ error: 'Invalid capabilities' }); return; }
       this.expire();
       let changed = false;
@@ -103,6 +111,7 @@ export class RemoteCoordinator {
       this.store.transaction(() => {
         const run = this.store.getRun(lease.run_id)!;
         const succeeded = result.ok && !result.timedOut && result.exitCode === 0;
+        if (succeeded) this.store.markWorkerSuccess(lease.worker_id, this.now());
         this.store.finishRun(run.id, { status: result.timedOut ? 'timeout' : succeeded ? 'succeeded' : 'failed', output_tail: result.outputTail,
           input_tokens: result.inputTokens, output_tokens: result.outputTokens, cost_estimate: result.costEstimate });
         const task = this.store.getTask(run.task_id)!;
@@ -110,7 +119,9 @@ export class RemoteCoordinator {
         // only moves the task when nobody moved it while the worker was running.
         if (!succeeded) this.store.updateTask(task.id, { status: 'needs_human' });
         else if (task.status === 'in_progress') this.store.updateTask(task.id, { status: lease.disposition });
-        this.store.addComment(task.id, run.agent, `Worker ${lease.worker_id} ${succeeded ? 'finished' : 'failed'}. Files remain on that PC.\n${result.outputTail.slice(-2000)}`);
+        const gitInfo = result.headSha !== undefined && result.dirtyFiles !== undefined
+          ? ` HEAD ${result.headSha.slice(0, 7)} with ${result.dirtyFiles} uncommitted file(s) on that PC.` : '';
+        this.store.addComment(task.id, run.agent, `Worker ${lease.worker_id} ${succeeded ? 'finished' : 'failed'}. Files remain on that PC.\n${result.outputTail.slice(-2000)}${gitInfo}`);
         this.store.updateLease(run.id, this.now(), 'completed');
       });
       this.bus.change({ kind: 'remote_finished' });
@@ -121,6 +132,26 @@ export class RemoteCoordinator {
       if (!lease || !equal(this.bearer(req.headers.authorization), lease.token)) { res.sendStatus(401); return; }
       if (!this.valid(lease)) { res.sendStatus(409); return; }
       void this.mcp(lease, req, res).catch(() => { if (!res.headersSent) res.sendStatus(500); });
+    });
+    this.app.post('/workers/:worker/runs/:run/exited', (req, res) => {
+      if (!this.authenticate(req.params.worker, req.headers.authorization)) { res.sendStatus(401); return; }
+      // Exit evidence authenticates the original lease without renewing or expiring it.
+      const lease = this.store.getLease(Number(req.params.run));
+      const run = lease && this.store.getRun(lease.run_id);
+      if (!lease || !run || lease.worker_id !== req.params.worker || !equal(String(req.headers['x-run-token'] ?? ''), lease.token)) { res.sendStatus(403); return; }
+      const parsed = exitedSchema.safeParse(req.body);
+      if (!parsed.success) { res.sendStatus(400); return; }
+      const changed = this.store.transaction(() => {
+        this.store.touchWorker(lease.worker_id, 'exited', this.now());
+        if (this.store.getRun(run.id)!.reconciled_at !== null) return false;
+        const at = parsed.data.exitedAt ?? new Date(this.now()).toISOString();
+        this.store.reconcileRun(run.id, `worker:${lease.worker_id}`, at);
+        this.store.addComment(run.task_id, run.agent,
+          `Worker ${lease.worker_id} reports the process for run ${run.id} exited (${parsed.data.exitCode ?? 'unknown'}) at ${at}. This is evidence the process stopped, not that the work is correct; files on that PC are unchanged by this report.`);
+        return true;
+      });
+      if (changed) this.bus.change({ kind: 'remote_reconciled' });
+      res.json({ accepted: true });
     });
   }
 
@@ -137,6 +168,7 @@ export class RemoteCoordinator {
     this.expire();
     const lease = this.store.getLease(Number(req.params.run));
     if (!lease || lease.worker_id !== req.params.worker || !equal(String(req.headers['x-run-token'] ?? ''), lease.token)) { res.sendStatus(403); return; }
+    this.store.touchWorker(lease.worker_id, completed ? 'complete' : 'heartbeat', this.now());
     if (!(completed && lease.state === 'completed') && !this.valid(lease)) { res.sendStatus(409); return; }
     return lease;
   }
@@ -147,6 +179,7 @@ export class RemoteCoordinator {
         if (lease.expires_at > this.now()) continue;
         const run = this.store.getRun(lease.run_id)!;
         this.store.finishRun(run.id, { status: 'failed' });
+        this.store.setRunUncertain(run.id, `lease expired; worker ${lease.worker_id} may still be running it`);
         this.store.updateTask(run.task_id, { status: 'needs_human' });
         this.store.addComment(run.task_id, 'human', `Lost contact with worker ${lease.worker_id}. Work may still be running there. Stop/check that PC and recover its files before retrying; this task will not be automatically retried.`);
         this.store.updateLease(run.id, this.now(), 'lost');

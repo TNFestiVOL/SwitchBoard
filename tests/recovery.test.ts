@@ -31,6 +31,26 @@ function setup() {
 }
 
 describe('dispatcher failure boundaries', () => {
+  it('records distinct local and disabled-remote restart uncertainty', () => {
+    const s = setup();
+    s.store.setSetting('paused', '1');
+    const local = s.h.create_task({ project: 'p', title: 'local orphan', assignee: 'claude' });
+    const remote = s.h.create_task({ project: 'p', title: 'remote orphan', assignee: 'codex' });
+    const localRun = s.store.createRun(local.id, 'claude', 'local');
+    const remoteRun = s.store.createRun(remote.id, 'codex', 'remote');
+    s.store.createLease({ run_id: remoteRun.id, worker_id: 'alpha', token: 'a'.repeat(64), expires_at: Date.now() + 60_000 });
+    s.dispatcher.recoverOrphans({ remoteEnabled: false });
+    expect(s.store.listUncertainRuns()).toEqual([
+      expect.objectContaining({ id: localRun.id, status: 'failed', uncertain: 'orphaned by a Switchboard restart; the CLI may still be running' }),
+      expect.objectContaining({ id: remoteRun.id, status: 'failed', uncertain: 'leased to worker alpha; remote dispatch is no longer configured' }),
+    ]);
+    expect(s.store.getLease(remoteRun.id)?.state).toBe('lost');
+    expect(s.dispatcher.activeRuns()).toEqual([]);
+    expect(s.store.getTask(local.id)?.status).toBe('needs_human');
+    expect(s.store.getTask(remote.id)?.status).toBe('needs_human');
+    s.store.close();
+  });
+
   it('waits for a handoff to land and records the actual worktree in its prompt', async () => {
     const s = setup();
     const t = s.h.create_task({ project: 'p', title: 'handoff', assignee: 'claude' });

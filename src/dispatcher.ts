@@ -95,6 +95,9 @@ export class Dispatcher {
       const lease = this.store.getLease(run.id);
       if (lease && opts.remoteEnabled !== false) continue; // remote coordinator owns lease recovery
       this.store.finishRun(run.id, { status: 'failed', output_tail: run.output_tail || '[orphaned: process restarted mid-run]' });
+      this.store.setRunUncertain(run.id, lease
+        ? `leased to worker ${lease.worker_id}; remote dispatch is no longer configured`
+        : 'orphaned by a Switchboard restart; the CLI may still be running');
       if (lease) this.store.updateLease(run.id, Date.now(), 'lost');
       const task = this.store.getTask(run.task_id);
       if (task) {
@@ -289,6 +292,7 @@ export class Dispatcher {
     }
 
     // Keep the persisted run recoverable until finalization and task updates finish.
+    if (result.uncertain) this.store.setRunUncertain(flight.runId, result.uncertain);
     this.store.finishRun(flight.runId, {
       status: result.ok && (finalizationFailed || mergeConflict) ? 'failed' : status,
       output_tail: result.outputTail,

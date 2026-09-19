@@ -1,4 +1,6 @@
 import { existsSync, realpathSync, statSync } from 'node:fs';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { isAbsolute } from 'node:path';
 import type { Launcher, RunResult } from './launcher.js';
 import type { Agent } from './types.js';
@@ -12,6 +14,24 @@ export interface WorkerOptions {
   completeRetryMs?: number[];
   launcher: (order: WorkOrder) => Promise<Launcher> | Launcher;
   cleanup?: (order: WorkOrder) => Promise<void> | void;
+}
+
+class WorkerHttpError extends Error {
+  constructor(path: string, readonly status: number) {
+    super(`Worker request ${path} returned HTTP ${status}`);
+  }
+}
+
+const execFileAsync = promisify(execFile);
+
+async function gitMetadata(cwd: string): Promise<{ headSha?: string; dirtyFiles?: number }> {
+  const git = async (...args: string[]) => (await execFileAsync('git', args, { cwd, timeout: 5000, windowsHide: true, encoding: 'utf8' })).stdout.trim();
+  try {
+    if (await git('rev-parse', '--is-inside-work-tree') !== 'true') return {};
+    const headSha = await git('rev-parse', 'HEAD');
+    const status = await git('status', '--porcelain');
+    return { headSha, dirtyFiles: status ? status.split(/\r?\n/).length : 0 };
+  } catch { return {}; }
 }
 
 /** One active run per worker, with explicit local project allowlisting. */
@@ -34,8 +54,18 @@ export class RemoteWorker {
       method: 'POST', headers: { authorization: `Bearer ${this.opts.token}`, 'content-type': 'application/json', ...(token ? { 'x-run-token': token } : {}) },
       body: JSON.stringify(body), signal: AbortSignal.timeout(10_000), redirect: 'error',
     });
-    if (!response.ok) throw new Error(`Worker request ${path} returned HTTP ${response.status}`);
+    if (!response.ok) throw new WorkerHttpError(path, response.status);
     return response.json();
+  }
+  private async requestWithRetries(path: string, body: unknown, token: string): Promise<void> {
+    const delays = this.opts.completeRetryMs ?? [1000, 2000, 4000, 8000, 16000];
+    let failure: unknown;
+    for (let attempt = 0; attempt <= delays.length; attempt++) {
+      if (attempt > 0) await new Promise(resolve => setTimeout(resolve, delays[attempt - 1]));
+      try { await this.request(path, body, token); return; }
+      catch (e) { failure = e; }
+    }
+    throw failure;
   }
   async once(signal?: AbortSignal): Promise<boolean> {
     if (this.busy) throw new Error('Worker already has an active poll/run');
@@ -68,6 +98,7 @@ export class RemoteWorker {
     };
     beat();
     let result: RunResult;
+    let processExited = false;
     try {
       const cwd = this.paths[order.project];
       if (!cwd || realpathSync(cwd) !== cwd) throw new Error('Unmapped or changed project path');
@@ -79,7 +110,8 @@ export class RemoteWorker {
       });
       result = await launcher.launch(order.task.assignee as Agent, prompt, cwd, chunk => { tail = (tail + chunk).slice(-20_000); },
         { model: order.task.model ?? undefined, effort: order.task.effort ?? undefined }, { task: order.task, baseBranch: 'HEAD', signal: controller.signal });
-      if (controller.signal.aborted) result = { ...result, ok: false, timedOut: true };
+      processExited = true;
+      if (controller.signal.aborted) result = { ...result, ok: false, timedOut: true, exitCode: null };
     } catch (e) {
       result = { ok: false, timedOut: controller.signal.aborted, exitCode: null, outputTail: String(e).slice(-20_000), inputTokens: 0, outputTokens: 0, costEstimate: 0 };
     } finally {
@@ -88,14 +120,18 @@ export class RemoteWorker {
     try {
       // Idempotent completion: retry a lost response without rerunning the task. Heartbeats are
       // still running, so the lease stays valid across a short board outage.
-      const delays = this.opts.completeRetryMs ?? [1000, 2000, 4000, 8000, 16000];
-      let failure: unknown;
-      for (let attempt = 0; attempt <= delays.length; attempt++) {
-        if (attempt > 0) await new Promise(resolve => setTimeout(resolve, delays[attempt - 1]));
-        try { await this.request(`/runs/${order.runId}/complete`, result, order.token); return true; }
-        catch (e) { failure = e; }
+      const metadata = processExited ? await gitMetadata(this.paths[order.project]) : {};
+      try {
+        await this.requestWithRetries(`/runs/${order.runId}/complete`, { ...result, ...metadata }, order.token);
+        return true;
+      } catch (failure) {
+        if (processExited && failure instanceof WorkerHttpError && failure.status === 409) {
+          const evidence = { exitedAt: new Date().toISOString(), exitCode: result.exitCode };
+          try { await this.requestWithRetries(`/runs/${order.runId}/exited`, evidence, order.token); }
+          catch (e) { console.error(String(e)); }
+        }
+        throw failure;
       }
-      throw failure;
     } finally {
       stopped = true;
       if (timer) clearTimeout(timer);

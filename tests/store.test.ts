@@ -54,7 +54,7 @@ describe('Store host contract', () => {
     expect(backup.pragma('table_info(tasks)')).not.toEqual(expect.arrayContaining([expect.objectContaining({ name: 'model' })]));
     expect(backup.pragma('user_version', { simple: true })).toBe(0);
     expect(backup.pragma('integrity_check', { simple: true })).toBe('ok');
-    expect(SCHEMA_VERSION).toBe(2);
+    expect(SCHEMA_VERSION).toBe(3);
     expect(legacy.pragma('user_version', { simple: true })).toBe(SCHEMA_VERSION);
     expect(legacy.pragma('table_info(tasks)')).toEqual(expect.arrayContaining([expect.objectContaining({ name: 'model' })]));
   });
@@ -70,7 +70,7 @@ describe('Store host contract', () => {
     expect(backups()).toEqual(first);
   });
 
-  it('backs up version 1 exactly once before migrating to version 2', () => {
+  it('backs up version 1 exactly once before migrating to the current version', () => {
     const original = openStore();
     original.addProject('keep', '/keep');
     original.close();
@@ -80,7 +80,7 @@ describe('Store host contract', () => {
 
     openStore().close();
 
-    expect(db.pragma('user_version', { simple: true })).toBe(2);
+    expect(db.pragma('user_version', { simple: true })).toBe(SCHEMA_VERSION);
     const first = backups();
     expect(first).toHaveLength(1);
     const backup = openDatabase(join(dir, 'backups', first[0]));
@@ -89,6 +89,70 @@ describe('Store host contract', () => {
     expect(backup.prepare('SELECT name FROM projects').all()).toEqual([{ name: 'keep' }]);
     expect(openStore().getProjectByName('keep')?.path).toBe('/keep');
     expect(backups()).toEqual(first);
+  });
+
+  it('backs up version 2 exactly once before migrating to version 3', () => {
+    const original = openStore();
+    original.addProject('keep', '/keep');
+    original.close();
+    const db = openDatabase();
+    db.exec('DROP TABLE IF EXISTS workers');
+    for (const column of ['uncertain', 'reconciled_at', 'reconciled_by']) {
+      const columns = db.pragma('table_info(runs)') as { name: string }[];
+      if (columns.some(c => c.name === column)) db.exec(`ALTER TABLE runs DROP COLUMN ${column}`);
+    }
+    db.pragma('user_version = 2');
+
+    const migrated = openStore();
+    expect(db.pragma('user_version', { simple: true })).toBe(3);
+    expect(migrated.listWorkers()).toEqual([]);
+    expect(db.pragma('table_info(runs)')).toEqual(expect.arrayContaining(
+      ['uncertain', 'reconciled_at', 'reconciled_by'].map(name => expect.objectContaining({ name, type: 'TEXT' })),
+    ));
+    const first = backups();
+    expect(first).toHaveLength(1);
+    const backup = openDatabase(join(dir, 'backups', first[0]));
+    expect(backup.pragma('user_version', { simple: true })).toBe(2);
+    expect(backup.prepare("SELECT name FROM sqlite_master WHERE name = 'workers'").get()).toBeUndefined();
+    expect(backup.prepare('SELECT name FROM projects').all()).toEqual([{ name: 'keep' }]);
+    migrated.close();
+    expect(openStore().getProjectByName('keep')?.path).toBe('/keep');
+    expect(backups()).toEqual(first);
+  });
+
+  it('persists worker contacts, advertised lists, and the last success independently', () => {
+    const store = openStore();
+    store.touchWorker('alpha', 'claim', 100, { agents: ['codex'], projects: ['demo', 'second'] });
+    store.markWorkerSuccess('alpha', 110);
+    store.touchWorker('alpha', 'heartbeat', 120);
+    store.touchWorker('beta', 'exited', 130);
+    store.close();
+    const reopened = openStore();
+    expect(reopened.listWorkers()).toEqual([
+      { worker_id: 'alpha', last_contact_at: 120, last_contact_kind: 'heartbeat', agents: ['codex'], projects: ['demo', 'second'], last_success_at: 110 },
+      { worker_id: 'beta', last_contact_at: 130, last_contact_kind: 'exited', agents: [], projects: [], last_success_at: null },
+    ]);
+    reopened.touchWorker('alpha', 'claim', 140, { agents: [], projects: [] });
+    expect(reopened.listWorkers()[0]).toMatchObject({ agents: [], projects: [], last_success_at: 110 });
+  });
+
+  it('persists uncertainty and reconciliation without changing run or task outcomes', () => {
+    const store = openStore();
+    const project = store.addProject('demo', '/demo');
+    const task = store.createTask({ project_id: project.id, title: 'work', description: '', assignee: 'codex', created_by: 'human', status: 'needs_human' });
+    const run = store.createRun(task.id, 'codex', 'prompt');
+    expect(run).toMatchObject({ uncertain: null, reconciled_at: null, reconciled_by: null });
+    store.finishRun(run.id, { status: 'failed', output_tail: 'preserve output' });
+    store.setRunUncertain(run.id, 'the process may still be running');
+    store.close();
+    const reopened = openStore();
+    const uncertain = reopened.getRun(run.id)!;
+    expect(reopened.listUncertainRuns()).toEqual([uncertain]);
+    expect(reopened.runningRuns()).toEqual([]);
+    reopened.reconcileRun(run.id, 'worker:alpha', '2026-09-19T12:00:00Z');
+    expect(reopened.listUncertainRuns()).toEqual([]);
+    expect(reopened.getRun(run.id)).toEqual({ ...uncertain, reconciled_by: 'worker:alpha', reconciled_at: '2026-09-19T12:00:00Z' });
+    expect(reopened.getTask(task.id)).toEqual(task);
   });
 
   it('round-trips operations across reopening and keys them by actor and client_id', () => {

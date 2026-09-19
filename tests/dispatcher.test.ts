@@ -225,6 +225,34 @@ describe('Dispatcher', () => {
     expect(store.listComments(t.id).some(c => c.body.includes('boom stack trace'))).toBe(true);
   });
 
+  it('preserves an unconfirmed cancellation reason on a finished local run', async () => {
+    const d = make(); const t = seedTask('p1', 'nyx');
+    d.tick();
+    const reason = 'cancellation was not confirmed; the remote process may still be running';
+    launcher.calls[0].resolve({ ...failResult, uncertain: reason });
+    await flush();
+    expect(store.listUncertainRuns()).toEqual([expect.objectContaining({ task_id: t.id, status: 'failed', uncertain: reason })]);
+    expect(d.activeRuns()).toEqual([]);
+    expect(store.getTask(t.id)?.status).toBe('needs_human');
+  });
+
+  it('keeps dependency dispatch behavior unchanged for finished uncertain runs', async () => {
+    const d = make(); const parent = seedTask();
+    store.updateTask(parent.id, { status: 'review' });
+    const run = store.createRun(parent.id, 'claude', 'p');
+    store.finishRun(run.id, { status: 'failed' });
+    store.setRunUncertain(run.id, 'the CLI may still be running');
+    const dependent = seedTask('p2', 'codex', 'dependent');
+    store.addDependency(dependent.id, parent.id);
+    d.tick();
+    expect(launcher.calls).toHaveLength(1);
+    expect(launcher.calls[0].prompt).toContain('dependent');
+    expect(d.activeRuns().map(r => r.taskId)).toEqual([dependent.id]);
+    launcher.calls[0].resolve(okResult);
+    await flush();
+    expect(store.listUncertainRuns().map(r => r.id)).toEqual([run.id]);
+  });
+
   it('moves silently-successful runs to review', async () => {
     const d = make();
     const t = seedTask();

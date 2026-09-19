@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'node:f
 import { dirname, join } from 'node:path';
 import type { Agent, Author, Comment, Project, Run, RunStatus, Task, TaskStatus } from './types.js';
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS projects (
@@ -71,6 +71,14 @@ CREATE TABLE IF NOT EXISTS remote_leases (
   state TEXT NOT NULL DEFAULT 'active',
   disposition TEXT NOT NULL DEFAULT 'review'
 );
+CREATE TABLE IF NOT EXISTS workers (
+  worker_id TEXT PRIMARY KEY,
+  last_contact_at INTEGER NOT NULL,
+  last_contact_kind TEXT NOT NULL,
+  agents TEXT NOT NULL DEFAULT '[]',
+  projects TEXT NOT NULL DEFAULT '[]',
+  last_success_at INTEGER
+);
 `;
 
 export interface CreateTaskInput {
@@ -97,6 +105,21 @@ export interface Operation {
 export interface RemoteLease {
   run_id: number; worker_id: string; token: string; expires_at: number;
   state: 'active' | 'completed' | 'lost'; disposition: 'review' | 'needs_human';
+}
+
+export interface WorkerContact {
+  worker_id: string;
+  last_contact_at: number;
+  last_contact_kind: 'claim' | 'heartbeat' | 'complete' | 'exited';
+  agents: string[];
+  projects: string[];
+  last_success_at: number | null;
+}
+
+export interface StoredRun extends Run {
+  uncertain: string | null;
+  reconciled_at: string | null;
+  reconciled_by: string | null;
 }
 
 export interface TaskFilter {
@@ -154,6 +177,10 @@ export class Store {
     if (!cols.includes('model')) this.db.exec('ALTER TABLE tasks ADD COLUMN model TEXT');
     if (!cols.includes('effort')) this.db.exec('ALTER TABLE tasks ADD COLUMN effort TEXT');
     if (!cols.includes('worker_id')) this.db.exec('ALTER TABLE tasks ADD COLUMN worker_id TEXT');
+    const runCols = (this.db.pragma('table_info(runs)') as { name: string }[]).map(c => c.name);
+    for (const column of ['uncertain', 'reconciled_at', 'reconciled_by']) {
+      if (!runCols.includes(column)) this.db.exec(`ALTER TABLE runs ADD COLUMN ${column} TEXT`);
+    }
   }
 
   close(): void {
@@ -258,20 +285,20 @@ export class Store {
   }
 
   // --- runs ---
-  createRun(task_id: number, agent: Agent, prompt: string): Run {
+  createRun(task_id: number, agent: Agent, prompt: string): StoredRun {
     const info = this.db.prepare('INSERT INTO runs (task_id, agent, prompt) VALUES (?, ?, ?)').run(task_id, agent, prompt);
     return this.getRun(Number(info.lastInsertRowid))!;
   }
 
-  getRun(id: number): Run | undefined {
-    return this.db.prepare('SELECT * FROM runs WHERE id = ?').get(id) as Run | undefined;
+  getRun(id: number): StoredRun | undefined {
+    return this.db.prepare('SELECT * FROM runs WHERE id = ?').get(id) as StoredRun | undefined;
   }
 
   setRunPrompt(id: number, prompt: string): void {
     this.db.prepare('UPDATE runs SET prompt = ? WHERE id = ?').run(prompt, id);
   }
 
-  finishRun(id: number, fields: RunFinish): Run {
+  finishRun(id: number, fields: RunFinish): StoredRun {
     const keys = RUN_FINISH_KEYS.filter(k => fields[k] !== undefined);
     const sets = keys.map(k => `${k} = @${k}`).join(', ');
     this.db.prepare(
@@ -280,19 +307,31 @@ export class Store {
     return this.getRun(id)!;
   }
 
-  listRuns(task_id?: number): Run[] {
+  listRuns(task_id?: number): StoredRun[] {
     if (task_id !== undefined) {
-      return this.db.prepare('SELECT * FROM runs WHERE task_id = ? ORDER BY id').all(task_id) as Run[];
+      return this.db.prepare('SELECT * FROM runs WHERE task_id = ? ORDER BY id').all(task_id) as StoredRun[];
     }
-    return this.db.prepare('SELECT * FROM runs ORDER BY id').all() as Run[];
+    return this.db.prepare('SELECT * FROM runs ORDER BY id').all() as StoredRun[];
   }
 
-  runningRuns(): Run[] {
-    return this.db.prepare("SELECT * FROM runs WHERE status = 'running' ORDER BY id").all() as Run[];
+  runningRuns(): StoredRun[] {
+    return this.db.prepare("SELECT * FROM runs WHERE status = 'running' ORDER BY id").all() as StoredRun[];
   }
 
-  runsSince(iso: string): Run[] {
-    return this.db.prepare('SELECT * FROM runs WHERE started_at >= ? ORDER BY id').all(iso) as Run[];
+  runsSince(iso: string): StoredRun[] {
+    return this.db.prepare('SELECT * FROM runs WHERE started_at >= ? ORDER BY id').all(iso) as StoredRun[];
+  }
+
+  setRunUncertain(runId: number, reason: string): void {
+    this.db.prepare('UPDATE runs SET uncertain = ? WHERE id = ?').run(reason, runId);
+  }
+
+  reconcileRun(runId: number, by: string, at: string): void {
+    this.db.prepare('UPDATE runs SET reconciled_by = ?, reconciled_at = ? WHERE id = ? AND reconciled_at IS NULL').run(by, at, runId);
+  }
+
+  listUncertainRuns(): StoredRun[] {
+    return this.db.prepare('SELECT * FROM runs WHERE uncertain IS NOT NULL AND reconciled_at IS NULL ORDER BY id').all() as StoredRun[];
   }
 
   // --- dependencies ---
@@ -326,6 +365,26 @@ export class Store {
 
   activeLeases(): RemoteLease[] {
     return this.db.prepare("SELECT * FROM remote_leases WHERE state = 'active'").all() as RemoteLease[];
+  }
+
+  touchWorker(workerId: string, kind: WorkerContact['last_contact_kind'], now: number, advertised?: { agents: string[]; projects: string[] }): void {
+    this.db.prepare(`INSERT INTO workers (worker_id, last_contact_at, last_contact_kind, agents, projects)
+      VALUES (@workerId, @now, @kind, @agents, @projects)
+      ON CONFLICT(worker_id) DO UPDATE SET last_contact_at = excluded.last_contact_at,
+        last_contact_kind = excluded.last_contact_kind,
+        agents = CASE WHEN @advertised THEN excluded.agents ELSE workers.agents END,
+        projects = CASE WHEN @advertised THEN excluded.projects ELSE workers.projects END`)
+      .run({ workerId, kind, now, advertised: advertised ? 1 : 0,
+        agents: JSON.stringify(advertised?.agents ?? []), projects: JSON.stringify(advertised?.projects ?? []) });
+  }
+
+  markWorkerSuccess(workerId: string, now: number): void {
+    this.db.prepare('UPDATE workers SET last_success_at = ? WHERE worker_id = ?').run(now, workerId);
+  }
+
+  listWorkers(): WorkerContact[] {
+    const rows = this.db.prepare('SELECT * FROM workers ORDER BY worker_id').all() as (Omit<WorkerContact, 'agents' | 'projects'> & { agents: string; projects: string })[];
+    return rows.map(row => ({ ...row, agents: JSON.parse(row.agents), projects: JSON.parse(row.projects) }));
   }
 
   updateLease(runId: number, expiresAt: number, state: RemoteLease['state'], disposition?: RemoteLease['disposition']): void {
