@@ -31,6 +31,19 @@ function board(tasks: Task[]): BoardData {
 }
 
 describe('dispatch header', () => {
+  it('renders a sign out form only for an authenticated board', () => {
+    const html = renderBoard({ ...board([]), authenticated: true });
+    expect(html).toMatch(/<form[^>]*method="post"[^>]*action="\/logout"[^>]*>/);
+    expect(html).toContain('Sign out</button>');
+  });
+
+  it('omits sign out when authentication is false or unspecified', () => {
+    for (const data of [board([]), { ...board([]), authenticated: false }]) {
+      expect(renderBoard(data)).not.toContain('action="/logout"');
+      expect(renderBoard(data)).not.toContain('Sign out</button>');
+    }
+  });
+
   it('shows the draining banner and disables resume while draining', () => {
     const html = renderBoard({ ...board([]), paused: true, draining: true });
     expect(html).toContain('Dispatch is draining — the host stops when running jobs finish.');

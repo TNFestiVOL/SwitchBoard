@@ -1,4 +1,5 @@
 import express from 'express';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import type { Server } from 'node:http';
 import { isIP } from 'node:net';
@@ -8,12 +9,13 @@ import type { EventBus } from './events.js';
 import type { Dispatcher } from './dispatcher.js';
 import { handleMcpRequest } from './mcp.js';
 import { toolHandlers, ToolError, ConflictError } from './tools.js';
-import { renderBoard, renderTask, type BoardData, type MachineChoice } from './ui.js';
+import { esc, layout, renderBoard, renderTask, type BoardData, type MachineChoice } from './ui.js';
 import { plannerBrief } from './prompt.js';
 import { DEFAULT_MODEL_CHOICES } from './config.js';
 import { AGENTS, type Agent, type Author, type TaskStatus } from './types.js';
 
 export interface AppDeps {
+  operatorPassword?: string;
   machines?: MachineChoice[];
   /** Configured remote worker ids; create_task rejects any other worker_id. */
   workers?: ReadonlySet<string>;
@@ -54,8 +56,117 @@ export const mcpLoopbackGuard: express.RequestHandler = (req, res, next) => {
   next();
 };
 
-export function createApp({ store, bus, dispatcher, shutdown, readiness, info, agentInfo, persistTuning, modelChoices, machines, workers }: AppDeps): express.Express {
+const SESSION_DAY = 24 * 60 * 60 * 1000;
+const SESSION_LIFETIME = 30 * SESSION_DAY;
+
+function operatorAuth(app: express.Express, store: Store, password: string): void {
+  const passwordHash = createHash('sha256').update(password).digest();
+  const failures = new Map<string, { count: number; expires: number }>();
+  const rotateSecret = (): string => {
+    const secret = randomBytes(32).toString('hex');
+    store.setSetting('session_secret', secret);
+    return secret;
+  };
+  const signature = (timestamp: string, secret: string): Buffer =>
+    createHmac('sha256', Buffer.from(secret, 'hex')).update(timestamp).digest();
+  const cookieOptions = (req: express.Request): express.CookieOptions => ({
+    httpOnly: true, sameSite: 'lax', path: '/', secure: req.secure,
+  });
+  const setSession = (req: express.Request, res: express.Response): void => {
+    const secret = store.getSetting('session_secret', '') || rotateSecret();
+    const timestamp = String(Date.now());
+    res.cookie('sb_session', `${timestamp}.${signature(timestamp, secret).toString('hex')}`, {
+      ...cookieOptions(req), maxAge: SESSION_LIFETIME,
+    });
+  };
+  const sessionAge = (req: express.Request): number | undefined => {
+    const cookie = req.headers.cookie?.split(';').map(part => part.trim()).find(part => part.startsWith('sb_session='))?.slice('sb_session='.length);
+    const match = cookie?.match(/^(\d{1,16})\.([a-f0-9]{64})$/);
+    if (!match) return;
+    const timestamp = Number(match[1]);
+    const age = Date.now() - timestamp;
+    if (!Number.isSafeInteger(timestamp) || age < 0 || age >= SESSION_LIFETIME) return;
+    const secret = store.getSetting('session_secret', '');
+    if (!secret || !timingSafeEqual(signature(match[1], secret), Buffer.from(match[2], 'hex'))) return;
+    return age;
+  };
+  const safeNext = (value: unknown): string =>
+    typeof value === 'string' && /^\/(?!\/)/.test(value) && !/[\\\x00-\x1f\x7f]/.test(value) ? value : '/';
+  const loginPage = (next: unknown, error = ''): string => layout('Sign in - Switchboard', `
+    <header><a class="brand" href="/" aria-label="Switchboard home"><img src="/logo.png" alt="Switchboard"></a></header>
+    <main class="panel"><h2>Sign in</h2>
+      ${error ? `<p role="alert">${esc(error)}</p>` : ''}
+      <form method="post" action="/login" class="inline">
+        <input type="hidden" name="next" value="${esc(safeNext(next))}">
+        <label>Password <input type="password" name="password" autocomplete="current-password" required autofocus></label>
+        <button type="submit">Sign in</button>
+      </form>
+    </main>`, 'es.close();');
+
+  app.use((req, res, next) => {
+    // MCP keeps its socket-only identity boundary, independently of operator sessions.
+    if (/^\/mcp(?:\/|$)/i.test(req.path)) { next(); return; }
+    res.set('Cache-Control', 'no-store');
+    const age = sessionAge(req);
+    if (age !== undefined) {
+      res.locals.authenticated = true;
+      if (age > SESSION_DAY) setSession(req, res);
+      next();
+      return;
+    }
+    const publicRoute = /^\/(?:login|health\/(?:live|ready)|logo\.png)\/?$/i.test(req.path);
+    const local = isLoopbackAddress(req.socket.remoteAddress)
+      && req.headers['x-forwarded-for'] === undefined && req.headers.forwarded === undefined;
+    if (publicRoute || local) { next(); return; }
+    if (req.method === 'GET' && /^\/(?:task\/[^/]+\/?)?$/i.test(req.path)) {
+      res.redirect(`/login?next=${encodeURIComponent(req.originalUrl)}`);
+    } else {
+      res.status(401).json({ error: 'sign in required' });
+    }
+  });
+
+  app.get('/login', (req, res) => { res.send(loginPage(req.query.next)); });
+  app.post('/login', express.urlencoded({ extended: false, limit: '16kb' }), express.json({ limit: '16kb' }), (req, res) => {
+    const now = Date.now();
+    for (const [address, failure] of failures) {
+      if (failure.expires <= now) failures.delete(address);
+    }
+    const address = req.socket.remoteAddress ?? 'unknown';
+    const failure = failures.get(address);
+    const next = req.body?.next ?? req.query.next;
+    if (failure && failure.count >= 5) {
+      res.set('Retry-After', String(Math.ceil((failure.expires - now) / 1000)));
+      res.status(429).send(loginPage(next, 'Too many attempts. Try again in a minute.'));
+      return;
+    }
+    const supplied = typeof req.body?.password === 'string' ? req.body.password : '';
+    const suppliedHash = createHash('sha256').update(supplied).digest();
+    if (!timingSafeEqual(passwordHash, suppliedHash)) {
+      const count = (failure?.count ?? 0) + 1;
+      failures.set(address, { count, expires: count >= 5 ? now + 60_000 : failure?.expires ?? now + 60_000 });
+      res.status(401).send(loginPage(next, 'Incorrect password'));
+      return;
+    }
+    failures.delete(address);
+    setSession(req, res);
+    res.redirect(safeNext(next));
+  });
+
+  app.post('/logout', (req, res) => {
+    res.clearCookie('sb_session', cookieOptions(req));
+    res.redirect('/login');
+  });
+  app.post('/logout-all', (req, res) => {
+    rotateSecret();
+    res.clearCookie('sb_session', cookieOptions(req));
+    res.redirect('/login');
+  });
+}
+
+export function createApp({ store, bus, dispatcher, shutdown, readiness, info, agentInfo, persistTuning, modelChoices, machines, workers, operatorPassword }: AppDeps): express.Express {
   const app = express();
+  app.set('trust proxy', 'loopback');
+  if (operatorPassword) operatorAuth(app, store, operatorPassword);
   const human = toolHandlers(store, bus, 'human', { workers });
   // Preserve the caller's nested tuning objects (the UI mutates them in place),
   // while ensuring the board has a complete record for all dispatchable agents.
@@ -79,7 +190,8 @@ export function createApp({ store, bus, dispatcher, shutdown, readiness, info, a
     return map;
   };
 
-  const boardData = (): BoardData => ({
+  const boardData = (authenticated = false): BoardData => ({
+    ...(operatorPassword ? { authenticated } : {}),
     machines,
     tasks: store.listTasks(),
     deps: depsFor(store.listTasks()),
@@ -320,7 +432,7 @@ export function createApp({ store, bus, dispatcher, shutdown, readiness, info, a
   });
 
   app.get('/api/state', (_req, res) => {
-    res.json(boardData());
+    res.json(boardData(res.locals.authenticated === true));
   });
 
   app.get('/api/runs/:id/output', (req, res) => {
@@ -340,7 +452,7 @@ export function createApp({ store, bus, dispatcher, shutdown, readiness, info, a
 
   // --- HTML UI ---
   app.get('/', (_req, res) => {
-    res.send(renderBoard(boardData()));
+    res.send(renderBoard(boardData(res.locals.authenticated === true)));
   });
 
   app.get('/task/:id', (req, res) => {
@@ -353,7 +465,7 @@ export function createApp({ store, bus, dispatcher, shutdown, readiness, info, a
     const activeRunId = dispatcher.activeRuns().find(r => r.taskId === task.id)?.runId;
     res.send(renderTask(
       { task, project, comments: store.listComments(task.id), runs: store.listRuns(task.id), activeRunId },
-      boardData(),
+      boardData(res.locals.authenticated === true),
     ));
   });
 

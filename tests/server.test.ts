@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import request from 'supertest';
 import express, { type Request, type Response } from 'express';
 import { EventEmitter } from 'node:events';
+import { createHmac } from 'node:crypto';
 import type { Server } from 'node:http';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -97,6 +98,315 @@ describe('listener failures', () => {
     } finally {
       log.mockRestore();
     }
+  });
+});
+
+describe('operator sessions', () => {
+  const password = 'correct horse battery staple';
+  const day = 24 * 60 * 60 * 1000;
+  let store: Store;
+  let bus: EventBus;
+  let dispatcher: Dispatcher;
+  let app: ReturnType<typeof createApp>;
+
+  const forwarded = { 'X-Forwarded-For': '192.0.2.20' };
+  const sessionCookie = (res: request.Response): string => {
+    const cookies = res.headers['set-cookie'];
+    expect(cookies).toBeDefined();
+    return cookies[0].split(';')[0];
+  };
+  const signedCookie = (issuedAt: number, secret = store.getSetting('session_secret', '')): string => {
+    const timestamp = String(issuedAt);
+    const signature = createHmac('sha256', Buffer.from(secret, 'hex')).update(timestamp).digest('hex');
+    return `sb_session=${timestamp}.${signature}`;
+  };
+  const fromSocket = (address: string, child = app): express.Express => {
+    const parent = express();
+    parent.set('trust proxy', true);
+    parent.use((req, _res, next) => {
+      Object.defineProperty(req.socket, 'remoteAddress', { value: address });
+      next();
+    });
+    parent.use(child);
+    return parent;
+  };
+  const login = () => request(app).post('/login').set(forwarded).send({ password });
+
+  beforeEach(() => {
+    store = new Store(':memory:');
+    bus = new EventBus();
+    dispatcher = new Dispatcher(store, new IdleLauncher(), bus, { budgets: {}, bounceCap: 6 });
+    store.addProject('private-project', 'Z:/private');
+    store.createTask({ project_id: 1, title: 'Private task', description: '', assignee: 'human', created_by: 'human', status: 'inbox' });
+    app = createApp({ store, bus, dispatcher, operatorPassword: password });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    store.close();
+  });
+
+  it('keeps the board open when the operator password is unset or empty', async () => {
+    for (const operatorPassword of [undefined, '']) {
+      const openApp = fromSocket('192.0.2.20', createApp({ store, bus, dispatcher, operatorPassword }));
+      for (const path of ['/', '/task/1', '/api/state', '/api/info']) {
+        const res = await request(openApp).get(path);
+        expect(res.status).toBe(200);
+        expect(res.headers['set-cookie']).toBeUndefined();
+      }
+    }
+    expect(store.getSetting('session_secret', '')).toBe('');
+  });
+
+  it('redirects unauthenticated HTML requests with their original next path', async () => {
+    for (const path of ['/', '/task/1', '/task/1?view=full']) {
+      const res = await request(app).get(path).set(forwarded);
+      expect(res.status).toBe(302);
+      expect(res.headers.location).toBe(`/login?next=${encodeURIComponent(path)}`);
+    }
+  });
+
+  it('requires sign in for API reads, mutations, events, and unknown routes', async () => {
+    for (const path of ['/api/state', '/api/info', '/events', '/unknown', '/health/other']) {
+      const res = await request(app).get(path).set(forwarded);
+      expect(res.status).toBe(401);
+      expect(res.body).toEqual({ error: 'sign in required' });
+    }
+    for (const path of ['/api/drain', '/api/drain/clear', '/api/resume', '/api/shutdown', '/logout', '/logout-all']) {
+      const res = await request(app).post(path).set(forwarded);
+      expect(res.status).toBe(401);
+      expect(res.body).toEqual({ error: 'sign in required' });
+    }
+    expect(store.getSetting('draining', '0')).toBe('0');
+  });
+
+  it('allows health checks and the logo without a session', async () => {
+    for (const path of ['/health/live', '/health/ready', '/logo.png']) {
+      expect((await request(app).get(path).set(forwarded)).status).toBe(200);
+    }
+  });
+
+  it('renders an escaped login form using the board layout without private data', async () => {
+    const res = await request(app).get('/login').set(forwarded).query({ next: '/task/1?x="<tag>' });
+    expect(res.status).toBe(200);
+    expect(res.text).toContain('<style>');
+    expect(res.text).toMatch(/<form[^>]*method="post"[^>]*action="\/login"/);
+    expect(res.text.match(/type="password"/g)).toHaveLength(1);
+    expect(res.text).toContain('Sign in</button>');
+    expect(res.text).toContain('/task/1?x=&quot;&lt;tag&gt;');
+    expect(res.text).not.toContain('Private task');
+    expect(res.text).not.toContain('private-project');
+    expect(res.text).not.toContain(password);
+  });
+
+  it('rejects wrong or missing passwords with an error page and no cookie', async () => {
+    for (const body of [{ password: 'wrong' }, {}, { password: ['wrong'] }]) {
+      const res = await request(app).post('/login').set(forwarded).send({ ...body, next: '/task/1' });
+      expect(res.status).toBe(401);
+      expect(res.text).toContain('Incorrect password');
+      expect(res.text).toContain('type="password"');
+      expect(res.text).toContain('value="/task/1"');
+      expect(res.headers['set-cookie']).toBeUndefined();
+    }
+  });
+
+  it('accepts JSON login and sets a persistent HttpOnly SameSite cookie', async () => {
+    const res = await login();
+    expect(res.status).toBe(302);
+    expect(res.headers.location).toBe('/');
+    expect(sessionCookie(res)).toMatch(/^sb_session=\d+\.[a-f0-9]{64}$/);
+    expect(res.headers['set-cookie'][0]).toContain('HttpOnly');
+    expect(res.headers['set-cookie'][0]).toContain('SameSite=Lax');
+    expect(res.headers['set-cookie'][0]).toContain('Path=/');
+    expect(res.headers['set-cookie'][0]).toContain('Max-Age=2592000');
+    expect(res.headers['set-cookie'][0]).not.toContain('Secure');
+    expect(store.getSetting('session_secret', '')).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it('accepts form login and redirects to a safe relative next path', async () => {
+    const res = await request(app).post('/login').set(forwarded).type('form').send({ password, next: '/task/1?view=full' });
+    expect(res.status).toBe(302);
+    expect(res.headers.location).toBe('/task/1?view=full');
+    expect(sessionCookie(res)).toMatch(/^sb_session=/);
+  });
+
+  it('rejects external and browser-normalized external next paths', async () => {
+    for (const next of ['//evil.example', 'https://evil.example', '/\\evil.example', '/\t/evil.example', 'relative']) {
+      const res = await request(app).post('/login').set(forwarded).send({ password, next });
+      expect(res.status).toBe(302);
+      expect(res.headers.location).toBe('/');
+    }
+  });
+
+  it('accepts the session for board, task, and API requests and shows sign out', async () => {
+    const cookie = sessionCookie(await login());
+    for (const path of ['/', '/task/1', '/api/state']) {
+      const res = await request(app).get(path).set(forwarded).set('Cookie', `other=one; ${cookie}; last=two`);
+      expect(res.status).toBe(200);
+      if (path === '/api/state') expect(res.body.authenticated).toBe(true);
+      else expect(res.text).toContain('Sign out</button>');
+    }
+  });
+
+  it('allows loopback sockets without forwarding headers and without a cookie', async () => {
+    for (const address of ['127.0.0.1', '127.23.45.67', '::1', '::ffff:127.0.0.1']) {
+      const res = await request(fromSocket(address)).get('/api/state');
+      expect(res.status).toBe(200);
+      expect(res.headers['set-cookie']).toBeUndefined();
+    }
+    expect((await request(app).get('/')).text).not.toContain('Sign out</button>');
+  });
+
+  it('preserves local drain, clear, resume, and shutdown without credentials', async () => {
+    for (const path of ['/api/drain', '/api/drain/clear', '/api/resume', '/api/drain']) {
+      expect((await request(app).post(path)).status).toBe(200);
+    }
+    expect((await request(app).post('/api/shutdown')).status).toBe(202);
+  });
+
+  it('disallows the local bypass when either forwarding header is present even if empty', async () => {
+    for (const [name, value] of [
+      ['X-Forwarded-For', '192.0.2.20'], ['X-Forwarded-For', ''],
+      ['Forwarded', 'for=192.0.2.20'], ['Forwarded', ''],
+    ]) {
+      const res = await request(fromSocket('127.0.0.1')).get('/api/state').set(name, value);
+      expect(res.status).toBe(401);
+    }
+  });
+
+  it('never accepts a LAN socket as local based on forwarding headers', async () => {
+    const lan = fromSocket('192.0.2.20');
+    expect((await request(lan).get('/api/state')).status).toBe(401);
+    const res = await request(lan).get('/api/state').set('X-Forwarded-For', '127.0.0.1').set('Forwarded', 'for="[::1]"');
+    expect(res.status).toBe(401);
+  });
+
+  it('sets Secure only when HTTPS is reported by a trusted loopback proxy', async () => {
+    for (const [address, secure] of [['127.0.0.1', true], ['::1', true], ['192.0.2.20', false]] as const) {
+      const res = await request(fromSocket(address)).post('/login').set(forwarded)
+        .set('X-Forwarded-Proto', 'https').send({ password });
+      expect(res.status).toBe(302);
+      expect(res.headers['set-cookie'][0].includes('; Secure')).toBe(secure);
+    }
+  });
+
+  it('clears the current cookie on logout while keeping other sessions valid', async () => {
+    const cookie = sessionCookie(await login());
+    const res = await request(app).post('/logout').set(forwarded).set('X-Forwarded-Proto', 'https').set('Cookie', cookie);
+    expect(res.status).toBe(302);
+    expect(res.headers['set-cookie'][0]).toContain('sb_session=;');
+    expect(res.headers['set-cookie'][0]).toContain('Expires=Thu, 01 Jan 1970');
+    expect(res.headers['set-cookie'][0]).toContain('Secure');
+    expect((await request(app).get('/api/state').set(forwarded)).status).toBe(401);
+    expect((await request(app).get('/api/state').set(forwarded).set('Cookie', cookie)).status).toBe(200);
+  });
+
+  it('rotates the shared secret on logout-all and invalidates every existing session', async () => {
+    const cookie = sessionCookie(await login());
+    const secret = store.getSetting('session_secret', '');
+    const secondApp = createApp({ store, bus, dispatcher, operatorPassword: password });
+    const secondCookie = sessionCookie(await request(secondApp).post('/login').send({ password }));
+    const res = await request(app).post('/logout-all').set(forwarded).set('Cookie', cookie);
+    expect(res.status).toBe(302);
+    expect(res.headers['set-cookie'][0]).toContain('sb_session=;');
+    expect(store.getSetting('session_secret', '')).not.toBe(secret);
+    for (const oldCookie of [cookie, secondCookie]) {
+      expect((await request(secondApp).get('/api/state').set(forwarded).set('Cookie', oldCookie)).status).toBe(401);
+    }
+    const newCookie = sessionCookie(await login());
+    expect((await request(app).get('/api/state').set(forwarded).set('Cookie', newCookie)).status).toBe(200);
+  });
+
+  it('keeps persisted sessions valid across app recreation', async () => {
+    const cookie = sessionCookie(await login());
+    const secret = store.getSetting('session_secret', '');
+    const recreated = createApp({ store, bus, dispatcher, operatorPassword: password });
+    expect((await request(recreated).get('/api/state').set(forwarded).set('Cookie', cookie)).status).toBe(200);
+    expect(store.getSetting('session_secret', '')).toBe(secret);
+  });
+
+  it('rejects a cookie signed with a different secret', async () => {
+    await login();
+    const cookie = signedCookie(Date.now(), 'ab'.repeat(32));
+    expect((await request(app).get('/api/state').set(forwarded).set('Cookie', cookie)).status).toBe(401);
+  });
+
+  it('rejects malformed, tampered, future, and expired sessions', async () => {
+    const now = Date.now();
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    const cookie = sessionCookie(await login());
+    const malformed = ['sb_session=garbage', 'sb_session=%E0%A4%A', 'sb_session=1.00', `${cookie}extra`];
+    for (const invalid of [...malformed, signedCookie(now + 1), signedCookie(now - 30 * day)]) {
+      const res = await request(app).get('/api/state').set(forwarded).set('Cookie', invalid);
+      expect(res.status).toBe(401);
+      expect(res.headers['set-cookie']).toBeUndefined();
+    }
+  });
+
+  it('refreshes sessions older than one day and extends their lifetime', async () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    await login();
+    const res = await request(app).get('/api/state').set(forwarded).set('X-Forwarded-Proto', 'https')
+      .set('Cookie', signedCookie(now - 29 * day));
+    expect(res.status).toBe(200);
+    const renewed = sessionCookie(res);
+    expect(renewed).toBe(signedCookie(now));
+    expect(res.headers['set-cookie'][0]).toContain('HttpOnly');
+    expect(res.headers['set-cookie'][0]).toContain('SameSite=Lax');
+    expect(res.headers['set-cookie'][0]).toContain('Secure');
+    clock.mockReturnValue(now + 2 * day);
+    expect((await request(app).get('/api/state').set(forwarded).set('Cookie', renewed)).status).toBe(200);
+  });
+
+  it('does not refresh sessions at or below one day old', async () => {
+    const now = Date.now();
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    await login();
+    for (const age of [0, day]) {
+      const res = await request(app).get('/api/state').set(forwarded).set('Cookie', signedCookie(now - age));
+      expect(res.status).toBe(200);
+      expect(res.headers['set-cookie']).toBeUndefined();
+    }
+  });
+
+  it('rate limits the sixth failed login per socket for sixty seconds despite changing forwarded clients', async () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const res = await request(app).post('/login').set('X-Forwarded-For', `192.0.2.${attempt}`).send({ password: 'wrong' });
+      expect(res.status).toBe(401);
+    }
+    const blocked = await request(app).post('/login').set(forwarded).send({ password: 'wrong' });
+    expect(blocked.status).toBe(429);
+    expect(blocked.headers['set-cookie']).toBeUndefined();
+    expect(blocked.headers['retry-after']).toBe('60');
+    expect((await login()).status).toBe(429);
+    const otherSocket = await request(fromSocket('192.0.2.99')).post('/login').send({ password });
+    expect(otherSocket.status).toBe(302);
+    clock.mockReturnValue(now + 59_999);
+    expect((await login()).status).toBe(429);
+    clock.mockReturnValue(now + 60_000);
+    expect((await login()).status).toBe(302);
+  });
+
+  it('resets failed login counts after a successful sign in', async () => {
+    for (let round = 0; round < 2; round++) {
+      for (let attempt = 0; attempt < 4; attempt++) {
+        expect((await request(app).post('/login').send({ password: 'wrong' })).status).toBe(401);
+      }
+      expect((await login()).status).toBe(302);
+    }
+  });
+
+  it('leaves MCP governed only by its existing socket guard', async () => {
+    const local = await request(app).post('/mcp/impostor').set(forwarded).send({});
+    expect(local.status).toBe(404);
+    expect(local.body.error).toContain('Unknown MCP identity');
+    const cookie = sessionCookie(await login());
+    const remote = await request(fromSocket('192.0.2.20')).post('/mcp/human').set('Cookie', cookie).send({});
+    expect(remote.status).toBe(403);
+    expect(remote.body.error).toContain('MCP identities');
   });
 });
 

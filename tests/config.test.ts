@@ -4,10 +4,38 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig, resolveWorkerTokens, saveTuning, type Config } from '../src/config.js';
 
+describe('loadConfig board listener', () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'sb-bind-config-')); });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it('defaults the board bind address to all IPv4 interfaces', () => {
+    expect(loadConfig(dir).bindHost).toBe('0.0.0.0');
+  });
+
+  it('overrides the board bind address independently of the worker listener', () => {
+    writeFileSync(join(dir, 'switchboard.config.json'), JSON.stringify({
+      bindHost: '127.0.0.1', remote: { host: '192.0.2.10', port: 4781, tokenEnv: {} },
+    }));
+    const config = loadConfig(dir);
+    expect(config.bindHost).toBe('127.0.0.1');
+    expect(config.remote?.host).toBe('192.0.2.10');
+  });
+});
+
 describe('loadConfig auth detection', () => {
   let dir: string;
   beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'sb-auth-config-')); });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it('defaults the operator password environment variable name', () => {
+    expect(loadConfig(dir).operatorPasswordEnv).toBe('SWITCHBOARD_OPERATOR_PASSWORD');
+  });
+
+  it('overrides the operator password environment variable name', () => {
+    writeFileSync(join(dir, 'switchboard.config.json'), JSON.stringify({ operatorPasswordEnv: 'BOARD_PASSWORD' }));
+    expect(loadConfig(dir).operatorPasswordEnv).toBe('BOARD_PASSWORD');
+  });
 
   it('provides the default re-login patterns and grace window', () => {
     const config = loadConfig(dir);

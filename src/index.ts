@@ -29,6 +29,9 @@ try {
   }
 } catch { /* no .env — fine */ }
 
+const operatorPassword = process.env[config.operatorPasswordEnv];
+if (!operatorPassword) console.warn('operator password not set; board is open to the LAN');
+
 mkdirSync(dirname(config.dbPath), { recursive: true });
 
 // MCP config file handed to headless `claude -p` runs so they can reach this board.
@@ -124,6 +127,7 @@ const machines = (config.machines ?? [{ workerId: null, name: 'This PC', ip: '12
 }));
 const app = createApp({
   store, bus, dispatcher, agentInfo: config.tuning, modelChoices: config.modelChoices, machines,
+  operatorPassword,
   shutdown,
   persistTuning: () => saveTuning(configPath, config.tuning),
   workers: new Set(Object.keys(workerTokens.tokens)),
@@ -132,11 +136,11 @@ const app = createApp({
     : { ok: true },
   info: { version, bootId },
 });
-const boardServer = app.listen(config.port, '0.0.0.0', () => {
+const boardServer = app.listen(config.port, config.bindHost, () => {
   console.log(`
   Switchboard is up.
 
-    Board UI      http://localhost:${config.port}/
+    Board UI      http://${config.bindHost.includes(':') ? `[${config.bindHost}]` : config.bindHost}:${config.port}/
     Claude MCP    http://localhost:${config.port}/mcp/claude
     Codex MCP     http://localhost:${config.port}/mcp/codex
     Gemini MCP    http://localhost:${config.port}/mcp/gemini

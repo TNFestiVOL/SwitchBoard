@@ -9,6 +9,8 @@ export interface Config {
   machines?: { workerId: string | null; name: string; ip: string }[];
   remote?: { host?: string; port: number; tokenEnv: Record<string, string> };
   port: number;
+  bindHost: string;
+  operatorPasswordEnv: string;
   dbPath: string;
   bounceCap: number;
   timeoutMs: number;
@@ -100,6 +102,8 @@ const perAgent = <T>(value: T): Record<Agent, T> =>
 
 const defaults = (root: string): Config => ({
   port: 4680,
+  bindHost: '0.0.0.0',
+  operatorPasswordEnv: 'SWITCHBOARD_OPERATOR_PASSWORD',
   dbPath: join(root, 'data', 'switchboard.db'),
   bounceCap: 6,
   timeoutMs: 15 * 60_000,

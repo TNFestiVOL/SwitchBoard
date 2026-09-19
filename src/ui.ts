@@ -8,6 +8,7 @@ export interface PlanView { usage: PlanUsage | null; maxPercent: number; blocked
 export interface AgentInfo { model?: string; effort?: string; }
 export interface MachineChoice { workerId: string | null; name: string; ip: string; configured: boolean; }
 export interface BoardData {
+  authenticated?: boolean;
   machines?: MachineChoice[];
   tasks: Task[];
   projects: Project[];
@@ -305,6 +306,7 @@ function header(data: BoardData): string {
       : '<button class="danger" onclick="api(\'/api/pause\')">⏸ Pause dispatch</button>'}
     <span class="muted">${data.activeRuns.length ? data.activeRuns.map(r => `<span class="badge run">${esc(r.agent)} running #${r.taskId}</span>`).join(' ') : 'idle'}</span>
     <div class="meters">${AGENTS.map(a => meter(a, data.budgets[a], data.plan[a], data.agents[a])).join('')}</div>
+    ${data.authenticated ? '<form method="post" action="/logout"><button type="submit">Sign out</button></form>' : ''}
   </header>${data.draining ? '<div class="banner">Dispatch is draining — the host stops when running jobs finish.</div>' : data.paused ? '<div class="banner">Dispatch is paused — agents will not be launched.</div>' : ''}</div>`;
 }
 
