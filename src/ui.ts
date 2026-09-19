@@ -106,6 +106,8 @@ button.danger { background: #5a2727; border-color: #8b3e3e; }
 .badge.deepseek { background: #3d1f4d; color: #d9b3f5; }
 .badge.human { background: #45400f; color: #efe49a; }
 .badge.proj { background: #2a2e38; color: #9aa3b5; }
+.badge.attn { background: #45400f; color: #efe49a; }
+.badge.brain { background: #3b3358; color: var(--violet); }
 .badge.run { background: #16324f; color: #9ecbff; animation: pulse 1.2s infinite alternate; }
 @keyframes pulse { from { opacity: .6; } to { opacity: 1; } }
 .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 9px; padding: 1rem 1.2rem; margin: 1rem 1.2rem; box-shadow: 0 7px 22px rgba(0, 0, 0, .12); }
@@ -142,6 +144,32 @@ let pending = null;
 let refreshing = false;
 let refreshAgain = false;
 const fragments = new Map([...document.querySelectorAll('[data-live]')].map(el => [el.dataset.live, el.innerHTML]));
+let attentionIds = new Set();
+function updateAlertButton() {
+  const button = document.getElementById('enable-alerts');
+  if (button) button.hidden = !window.Notification || Notification.permission !== 'default';
+}
+async function enableAlerts() {
+  if (window.Notification && Notification.permission === 'default') await Notification.requestPermission();
+  updateAlertButton();
+}
+function updateAttention(notify = false) {
+  const attention = JSON.parse(document.getElementById('attention')?.textContent || '[]');
+  const previousIds = attentionIds;
+  attentionIds = new Set(attention.map(task => task.id));
+  document.title = attentionIds.size ? '(' + attentionIds.size + ') Switchboard' : 'Switchboard';
+  updateAlertButton();
+  if (notify && window.Notification && Notification.permission === 'granted') {
+    for (const task of attention) if (!previousIds.has(task.id)) {
+      try {
+        new Notification('Switchboard: #' + task.id + ' needs you', {
+          body: task.title + ' (' + task.status + ')', tag: 'sb-attn-' + task.id,
+        });
+      } catch { /* The title count remains available if the browser cannot show notifications. */ }
+    }
+  }
+}
+updateAttention();
 function scheduleRefresh() { clearTimeout(pending); pending = setTimeout(refreshPage, 400); }
 es.onmessage = message => {
   let event;
@@ -162,16 +190,19 @@ async function refreshPage() {
     if (!res.ok) return;
     const next = new DOMParser().parseFromString(await res.text(), 'text/html');
     const x = window.scrollX, y = window.scrollY;
+    let swapped = false;
     for (const region of document.querySelectorAll('[data-live]')) {
       const incoming = next.querySelector('[data-live="' + region.dataset.live + '"]');
       if (!incoming || fragments.get(region.dataset.live) === incoming.innerHTML) continue;
       const scrolls = [...region.querySelectorAll('.col, .output')].map(el => [el.scrollLeft, el.scrollTop]);
       fragments.set(region.dataset.live, incoming.innerHTML);
       region.innerHTML = incoming.innerHTML;
+      swapped = true;
       region.querySelectorAll('.col, .output').forEach((el, i) => {
         if (scrolls[i]) { el.scrollLeft = scrolls[i][0]; el.scrollTop = scrolls[i][1]; }
       });
     }
+    if (swapped) updateAttention(true);
     // Refresh project choices without replacing form controls or disturbing drafts/focus.
     for (const select of document.querySelectorAll('select[name="project"]')) {
       const incoming = next.querySelector('select[name="project"]');
@@ -202,7 +233,7 @@ async function api(path, body) {
   if (!res.ok) {
     alert(await res.text());
     if (res.status === 409) await refreshPage();
-    return false;
+    return res.status;
   }
   await refreshPage();
   return true;
@@ -221,8 +252,8 @@ function submitForm(e, path) {
   const buttons = [...form.querySelectorAll('button[type="submit"]')];
   buttons.forEach(button => button.disabled = true);
   api(path, body).then(ok => {
-    if (ok) delete form.dataset.clientId;
-    if (ok && JSON.stringify(Object.fromEntries(new FormData(form).entries())) === JSON.stringify(data)) {
+    if (ok === true || ok === 409) delete form.dataset.clientId;
+    if (ok === true && JSON.stringify(Object.fromEntries(new FormData(form).entries())) === JSON.stringify(data)) {
       form.querySelectorAll('textarea, input:not([type="checkbox"]):not([type="hidden"])').forEach(input => input.value = '');
     }
   }).catch(() => alert('Could not reach Switchboard. Your draft is preserved.'))
@@ -298,16 +329,28 @@ function meter(agent: Agent, b: BudgetView, p: PlanView, info: AgentInfo): strin
 }
 
 function header(data: BoardData): string {
+  const attention = data.tasks.filter(t => t.status === 'needs_human' || t.status === 'review')
+    .map(({ id, title, status }) => ({ id, title, status }));
   return `<div data-live="header"><header>
     <a class="brand" href="/" aria-label="Switchboard home"><img src="/logo.png" alt="Switchboard"></a>
     <h1><a href="/">SWITCHBOARD</a></h1>
+    ${attention.length ? `<span class="badge attn" title="${esc(attention.map(t => `#${t.id} ${t.title} (${t.status})`).join('\n'))}">${attention.length} need you</span>` : ''}
+    <script type="application/json" id="attention">${JSON.stringify(attention).replace(/</g, '\\u003c')}</script>
+    <button id="enable-alerts" type="button" onclick="enableAlerts()" hidden>Enable alerts</button>
     ${data.draining ? '<button disabled>Draining…</button>' : data.paused
       ? '<button onclick="api(\'/api/resume\')">▶ Resume dispatch</button>'
       : '<button class="danger" onclick="api(\'/api/pause\')">⏸ Pause dispatch</button>'}
-    <span class="muted">${data.activeRuns.length ? data.activeRuns.map(r => `<span class="badge run">${esc(r.agent)} running #${r.taskId}</span>`).join(' ') : 'idle'}</span>
+    <span class="muted">${data.activeRuns.length ? data.activeRuns.map(r => {
+      const model = data.tasks.find(t => t.id === r.taskId)?.model;
+      return `<span class="badge run">${esc(r.agent)}${model ? `/${esc(model)}` : ''} running #${r.taskId}</span>`;
+    }).join(' ') : 'idle'}</span>
     <div class="meters">${AGENTS.map(a => meter(a, data.budgets[a], data.plan[a], data.agents[a])).join('')}</div>
     ${data.authenticated ? '<form method="post" action="/logout"><button type="submit">Sign out</button></form>' : ''}
   </header>${data.draining ? '<div class="banner">Dispatch is draining — the host stops when running jobs finish.</div>' : data.paused ? '<div class="banner">Dispatch is paused — agents will not be launched.</div>' : ''}</div>`;
+}
+
+function brainBadge(t: Task): string {
+  return t.model || t.effort ? `<span class="badge brain">${esc([t.model, t.effort].filter(Boolean).join(' · '))}</span>` : '';
 }
 
 function card(t: Task, projects: Project[], activeRuns: BoardData['activeRuns'], deps?: { on: number[]; unmet: number[] }): string {
@@ -320,6 +363,7 @@ function card(t: Task, projects: Project[], activeRuns: BoardData['activeRuns'],
     <div class="t">${esc(t.title)}</div>
     <span class="badge proj">${esc(proj?.name ?? '?')}</span>
     <span class="badge ${esc(t.assignee)}">${esc(t.assignee)}</span>
+    ${brainBadge(t)}
     ${t.worker_id ? `<span class="badge">PC: ${esc(t.worker_id)}</span>` : ''}
     ${running ? '<span class="badge run">running</span>' : ''}
     ${t.bounce_count > 0 ? `<span class="muted">↺${t.bounce_count}</span>` : ''}
@@ -519,10 +563,11 @@ export function renderTask(data: TaskData, board: BoardData): string {
     <h2>#${task.id} · ${esc(task.title)}
       <span class="badge proj">${esc(project.name)}</span>
       <span class="badge ${esc(task.assignee)}">${esc(task.assignee)}</span>
+      ${brainBadge(task)}
       <span class="badge proj">${esc(task.status)}</span>
     </h2>
     <p style="white-space:pre-wrap">${esc(task.description) || '<span class="muted">(no description)</span>'}</p>
-    <p class="muted">created by ${esc(task.created_by)} · bounces ${task.bounce_count} · dir ${esc(project.path)}${task.model || task.effort ? ` · brain: ${esc([task.model, task.effort].filter(Boolean).join(' · '))}` : ''}${board.deps[task.id] ? ` · depends on ${board.deps[task.id].on.map(d => `<a href="/task/${d}">#${d}</a>`).join(', ')}${board.deps[task.id].unmet.length ? ` (waiting: ${board.deps[task.id].unmet.map(d => '#' + d).join(', ')})` : ' (all satisfied)'}` : ''}</p>
+    <p class="muted">created by ${esc(task.created_by)} · bounces ${task.bounce_count} · dir ${esc(project.path)}${board.deps[task.id] ? ` · depends on ${board.deps[task.id].on.map(d => `<a href="/task/${d}">#${d}</a>`).join(', ')}${board.deps[task.id].unmet.length ? ` (waiting: ${board.deps[task.id].unmet.map(d => '#' + d).join(', ')})` : ' (all satisfied)'}` : ''}</p>
     <p class="muted">${esc(STATUS_HELP[task.status] ?? '')}</p>
     </div>
     <form class="inline" title="Move the task manually. Setting 'ready' (with an agent assignee) re-dispatches it." onsubmit="return submitForm(event, '/api/tasks/${task.id}/status')">
