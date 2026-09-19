@@ -54,7 +54,7 @@ describe('Store host contract', () => {
     expect(backup.pragma('table_info(tasks)')).not.toEqual(expect.arrayContaining([expect.objectContaining({ name: 'model' })]));
     expect(backup.pragma('user_version', { simple: true })).toBe(0);
     expect(backup.pragma('integrity_check', { simple: true })).toBe('ok');
-    expect(SCHEMA_VERSION).toBe(1);
+    expect(SCHEMA_VERSION).toBe(2);
     expect(legacy.pragma('user_version', { simple: true })).toBe(SCHEMA_VERSION);
     expect(legacy.pragma('table_info(tasks)')).toEqual(expect.arrayContaining([expect.objectContaining({ name: 'model' })]));
   });
@@ -68,6 +68,46 @@ describe('Store host contract', () => {
     openStore();
 
     expect(backups()).toEqual(first);
+  });
+
+  it('backs up version 1 exactly once before migrating to version 2', () => {
+    const original = openStore();
+    original.addProject('keep', '/keep');
+    original.close();
+    const db = openDatabase();
+    db.exec('DROP TABLE IF EXISTS operations');
+    db.pragma('user_version = 1');
+
+    openStore().close();
+
+    expect(db.pragma('user_version', { simple: true })).toBe(2);
+    const first = backups();
+    expect(first).toHaveLength(1);
+    const backup = openDatabase(join(dir, 'backups', first[0]));
+    expect(backup.pragma('user_version', { simple: true })).toBe(1);
+    expect(backup.prepare("SELECT name FROM sqlite_master WHERE name = 'operations'").get()).toBeUndefined();
+    expect(backup.prepare('SELECT name FROM projects').all()).toEqual([{ name: 'keep' }]);
+    expect(openStore().getProjectByName('keep')?.path).toBe('/keep');
+    expect(backups()).toEqual(first);
+  });
+
+  it('round-trips operations across reopening and keys them by actor and client_id', () => {
+    const store = openStore();
+    const operation = {
+      actor: 'human', client_id: 'retry_1', operation: 'add_comment',
+      body_hash: 'a'.repeat(64), result: JSON.stringify({ id: 42, body: 'saved' }),
+    };
+    expect(store.getOperation('human', 'retry_1')).toBeUndefined();
+    store.recordOperation(operation);
+    store.recordOperation({ ...operation, actor: 'another', result: '{}' });
+    expect(() => store.recordOperation(operation)).toThrow(/UNIQUE/);
+    store.close();
+
+    const reopened = openStore();
+    expect(reopened.getOperation('human', 'retry_1')).toEqual({ ...operation, created_at: expect.any(String) });
+    expect(reopened.getOperation('human', 'retry_1')?.created_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(reopened.getOperation('another', 'retry_1')?.result).toBe('{}');
+    expect(reopened.getOperation('human', 'missing')).toBeUndefined();
   });
 
   it('stamps a brand-new database without creating a backups directory', () => {

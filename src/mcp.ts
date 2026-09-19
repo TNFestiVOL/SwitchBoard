@@ -49,6 +49,7 @@ export async function handleMcpRequest(
     inputSchema: {
       project: z.string(), title: z.string(), description: z.string().optional(), assignee: authorSchema,
       model: z.string().optional(), effort: z.string().optional(),
+      client_id: z.string().optional().describe('same value on a retry returns the original result instead of repeating the action'),
       draft: z.boolean().optional().describe('true = park in the inbox for human review instead of dispatching; the assignee is kept for later release'),
       worker_id: z.string().optional().describe('Named remote PC worker (must be a configured worker id; only claude or codex can run remotely); omit to execute on the board host'),
       depends_on: z.array(z.number()).optional().describe('ids of tasks that must reach review/done before this one dispatches; declare true dependencies only — independent tasks may run in parallel'),
@@ -62,17 +63,17 @@ export async function handleMcpRequest(
 
   server.registerTool('add_comment', {
     description: 'Post a comment on a task. Authorship is your connection identity.',
-    inputSchema: { id: z.number(), body: z.string() },
+    inputSchema: { id: z.number(), body: z.string(), client_id: z.string().optional().describe('same value on a retry returns the original result instead of repeating the action') },
   }, wrap(h.add_comment));
 
   server.registerTool('assign_task', {
     description: 'Hand a task to an agent (claude, codex, nyx, gemini, deepseek — re-queues it for dispatch) or to "human" (needs_human).',
-    inputSchema: { id: z.number(), assignee: authorSchema },
+    inputSchema: { id: z.number(), assignee: authorSchema, client_id: z.string().optional().describe('same value on a retry returns the original result instead of repeating the action') },
   }, wrap(h.assign_task));
 
   server.registerTool('update_status', {
     description: 'Set task status: inbox, ready, in_progress, review, needs_human, or done. Setting "ready" re-queues for dispatch.',
-    inputSchema: { id: z.number(), status: statusSchema },
+    inputSchema: { id: z.number(), status: statusSchema, expected_status: statusSchema.optional(), client_id: z.string().optional().describe('same value on a retry returns the original result instead of repeating the action') },
   }, wrap(h.update_status));
 
   server.registerTool('finish_task', {

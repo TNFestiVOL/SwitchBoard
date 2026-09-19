@@ -262,6 +262,118 @@ describe('server', () => {
     expect((await request(app).post(`/api/tasks/${t.id}/status`).send({ status: 'nope' })).status).toBe(400);
   });
 
+  it.each(['boot-test', undefined])('sends hello with bootId=%s as the first SSE data frame', async bootId => {
+    const bus = new EventBus();
+    const eventsApp = createApp({ store, bus, dispatcher, info: bootId ? { version: '1.0.0', bootId } : undefined });
+    await new Promise<void>(resolve => { httpServer = eventsApp.listen(0, '127.0.0.1', resolve); });
+    const port = (httpServer!.address() as { port: number }).port;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1000);
+    let received = '';
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/events`, { signal: controller.signal });
+      expect(response.headers.get('content-type')).toBe('text/event-stream');
+      const reader = response.body!.getReader();
+      const decoder = new TextDecoder();
+      try {
+        while (!received.includes('data: ') || !received.slice(received.indexOf('data: ')).includes('\n\n')) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          received += decoder.decode(value, { stream: true });
+        }
+      } catch (error) {
+        if (!controller.signal.aborted) throw error;
+      } finally { await reader.cancel().catch(() => {}); }
+      expect(received.startsWith('retry: 3000\n\n')).toBe(true);
+      const first = received.split('\n\n').find(frame => frame.startsWith('data: '));
+      expect(first).toBe(`data: ${JSON.stringify({ kind: 'hello', bootId: bootId ?? '' })}`);
+    } finally {
+      clearTimeout(timeout);
+      controller.abort();
+      httpServer!.closeAllConnections();
+    }
+  });
+
+  const retryCases = [
+    { operation: 'create_task', path: '/api/tasks', args: { project: 'staging', title: 'retry', assignee: 'human' }, changed: { title: 'changed' }, status: 201 },
+    { operation: 'add_comment', path: '/api/tasks/1/comment', args: { id: 1, body: 'retry' }, changed: { body: 'changed' }, status: 200 },
+    { operation: 'assign_task', path: '/api/tasks/1/assign', args: { id: 1, assignee: 'codex' }, changed: { assignee: 'human' }, status: 200 },
+    { operation: 'update_status', path: '/api/tasks/1/status', args: { id: 1, status: 'ready' }, changed: { status: 'done' }, status: 200 },
+  ];
+
+  it('returns 409 for a stale status comparison and leaves API state unchanged', async () => {
+    store.createTask({ project_id: 1, title: 't', description: '', assignee: 'human', created_by: 'human', status: 'needs_human' });
+    const before = (await request(app).get('/api/state')).body.tasks;
+    const res = await request(app).post('/api/tasks/1/status').send({ status: 'done', expected_status: 'in_progress' });
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: 'task is now needs_human, not in_progress; reload and try again' });
+    expect((await request(app).get('/api/state')).body.tasks).toEqual(before);
+  });
+
+  it('accepts expected_status through MCP and rejects stale transitions', async () => {
+    store.createTask({ project_id: 1, title: 't', description: '', assignee: 'human', created_by: 'human', status: 'needs_human' });
+    await new Promise<void>(resolve => { httpServer = app.listen(0, '127.0.0.1', resolve); });
+    const port = (httpServer!.address() as { port: number }).port;
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    try {
+      await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp/human`)));
+      const stale = await client.callTool({ name: 'update_status', arguments: { id: 1, status: 'done', expected_status: 'in_progress' } });
+      expect(stale.isError).toBe(true);
+      expect(stale.content).toEqual([{ type: 'text', text: 'task is now needs_human, not in_progress; reload and try again' }]);
+      expect(store.getTask(1)?.status).toBe('needs_human');
+      const matched = await client.callTool({ name: 'update_status', arguments: { id: 1, status: 'done', expected_status: 'needs_human' } });
+      expect(matched.isError).not.toBe(true);
+      expect(store.getTask(1)?.status).toBe('done');
+    } finally { await client.close(); }
+  });
+
+  describe.each(retryCases)('$operation retries', ({ operation, path, args, changed, status }) => {
+    beforeEach(() => {
+      if (operation !== 'create_task') store.createTask({
+        project_id: 1, title: 'existing', description: '', assignee: 'human', created_by: 'human', status: 'inbox',
+      });
+    });
+
+    it('returns byte-identical HTTP JSON without repeating the action', async () => {
+      const body = { ...args, client_id: 'http_retry' };
+      const first = await request(app).post(path).send(body);
+      expect(first.status).toBe(status);
+      if (operation === 'assign_task' || operation === 'update_status') store.updateTask(1, { status: 'review' });
+      const before = store.getTask(1);
+      const replay = await request(app).post(path).send(body);
+      expect(replay.status).toBe(status);
+      expect(replay.text).toBe(first.text);
+      expect(store.listTasks()).toHaveLength(1);
+      expect(store.listComments(1)).toHaveLength(operation === 'add_comment' ? 1 : 0);
+      expect(store.getTask(1)).toEqual(before);
+    });
+
+    it('returns HTTP 409 when client_id is reused for a different body', async () => {
+      expect((await request(app).post(path).send({ ...args, client_id: 'conflict' })).status).toBe(status);
+      const res = await request(app).post(path).send({ ...args, ...changed, client_id: 'conflict' });
+      expect(res.status).toBe(409);
+      expect(res.body).toEqual({ error: 'client_id was already used with a different request' });
+    });
+
+    it('accepts client_id through MCP and replays the saved result', async () => {
+      await new Promise<void>(resolve => { httpServer = app.listen(0, '127.0.0.1', resolve); });
+      const port = (httpServer!.address() as { port: number }).port;
+      const client = new Client({ name: 'test', version: '0.0.0' });
+      try {
+        await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp/human`)));
+        const input = { name: operation, arguments: { ...args, client_id: 'mcp_retry' } };
+        const first = await client.callTool(input);
+        expect(first.isError).not.toBe(true);
+        if (operation === 'assign_task' || operation === 'update_status') store.updateTask(1, { status: 'review' });
+        const before = store.getTask(1);
+        expect(await client.callTool(input)).toEqual(first);
+        expect(store.listTasks()).toHaveLength(1);
+        expect(store.listComments(1)).toHaveLength(operation === 'add_comment' ? 1 : 0);
+        expect(store.getTask(1)).toEqual(before);
+      } finally { await client.close(); }
+    });
+  });
+
   it('creates a planning task via /api/plan with tuning and the planner brief', async () => {
     const res = await request(app).post('/api/plan').send({
       project: 'staging', goal: 'Build a snake game with tests', planner: 'claude', model: 'opus', effort: 'max',

@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { runInNewContext } from 'node:vm';
 import { COLLAPSE_AFTER, renderBoard, renderTask, type BoardData, type TaskData } from '../src/ui.js';
 import type { Task } from '../src/types.js';
 
@@ -85,6 +86,50 @@ describe('board columns fold after the newest cards', () => {
 });
 
 describe('live refresh script', () => {
+  it('handles hello events and reloads when the host boot changes', () => {
+    const html = renderBoard(board([]));
+    expect(html).toContain("kind === 'hello'");
+    expect(html).toContain('location.reload()');
+  });
+
+  it('suppresses hello refreshes and reloads only for a changed non-empty bootId', () => {
+    const html = renderBoard(board([]));
+    const script = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].find(match => match[1].includes('new EventSource'))![1];
+    const es = { onmessage: (_event: { data: string }) => {}, onopen: () => {} };
+    const reload = vi.fn();
+    const setTimeout = vi.fn();
+    runInNewContext(script, {
+      EventSource: function () { return es; },
+      document: { querySelectorAll: () => [] },
+      location: { pathname: '/', reload },
+      sessionStorage: { getItem: () => null },
+      setTimeout, clearTimeout: vi.fn(),
+    });
+    const send = (bootId: string) => es.onmessage({ data: JSON.stringify({ kind: 'hello', bootId }) });
+    send('first');
+    send('first');
+    send('');
+    expect(reload).not.toHaveBeenCalled();
+    expect(setTimeout).not.toHaveBeenCalled();
+    send('second');
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(setTimeout).not.toHaveBeenCalled();
+    es.onmessage({ data: JSON.stringify({ kind: 'status_changed', taskId: 1 }) });
+    expect(setTimeout).toHaveBeenCalledTimes(1);
+    es.onopen();
+    expect(setTimeout).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps a pending client_id and generates it with getRandomValues', () => {
+    const html = renderBoard(board([]));
+    const script = html.slice(html.indexOf('<script>'));
+    expect(script).toContain('form.dataset.clientId ??= newId()');
+    expect(script).toContain('getRandomValues(new Uint8Array(16))');
+    expect(script).toContain('client_id: form.dataset.clientId');
+    expect(script).toContain('if (ok) delete form.dataset.clientId');
+    expect(script).not.toContain('randomUUID');
+  });
+
   it('never clears hidden inputs when resetting a submitted form', () => {
     const html = renderBoard(board([]));
     // The tuning rows carry <input type="hidden" name="agent">; wiping it broke the second Apply.
@@ -116,5 +161,16 @@ describe('task page controls', () => {
     expect(html).toContain('<select name="status" data-rendered="in_progress">');
     expect(html).toContain('<option value="in_progress" selected>');
     expect(html).toContain('select[data-rendered]');
+  });
+
+  it('submits expected_status from the status select dataset.rendered', () => {
+    const html = renderTask(data('in_progress'), board([task(1, 'in_progress')]));
+    expect(html).toContain('select[name="status"][data-rendered]');
+    expect(html).toContain('body.expected_status = statusSelect.dataset.rendered');
+  });
+
+  it('refreshes the page after alerting a status conflict', () => {
+    const html = renderTask(data('in_progress'), board([task(1, 'in_progress')]));
+    expect(html).toContain('if (res.status === 409) await refreshPage()');
   });
 });

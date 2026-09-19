@@ -6,7 +6,7 @@ import type { Store } from './store.js';
 import type { EventBus } from './events.js';
 import type { Dispatcher } from './dispatcher.js';
 import { handleMcpRequest } from './mcp.js';
-import { toolHandlers, ToolError } from './tools.js';
+import { toolHandlers, ToolError, ConflictError } from './tools.js';
 import { renderBoard, renderTask, type BoardData, type MachineChoice } from './ui.js';
 import { plannerBrief } from './prompt.js';
 import { DEFAULT_MODEL_CHOICES } from './config.js';
@@ -92,6 +92,7 @@ export function createApp({ store, bus, dispatcher, readiness, info, agentInfo, 
       connection: 'keep-alive',
     });
     res.write('retry: 3000\n\n');
+    res.write(`data: ${JSON.stringify({ kind: 'hello', bootId: info?.bootId ?? '' })}\n\n`);
     const onChange = (e: { kind: string; taskId?: number }) => res.write(`data: ${JSON.stringify(e)}\n\n`);
     bus.onChange(onChange);
     const heartbeat = setInterval(() => res.write(': keepalive\n\n'), 25_000);
@@ -156,7 +157,8 @@ export function createApp({ store, bus, dispatcher, readiness, info, agentInfo, 
     try {
       res.status(status).json(fn());
     } catch (e) {
-      if (e instanceof ToolError) res.status(400).json({ error: e.message });
+      if (e instanceof ConflictError) res.status(409).json({ error: e.message });
+      else if (e instanceof ToolError) res.status(400).json({ error: e.message });
       else res.status(500).json({ error: String(e) });
     }
   };
@@ -178,8 +180,8 @@ export function createApp({ store, bus, dispatcher, readiness, info, agentInfo, 
   });
 
   app.post('/api/tasks', (req, res) => {
-    const { project, title, description, assignee, model, effort, worker_id } = req.body as Record<string, string>;
-    guard(res, () => human.create_task({ project, title, description, assignee: assignee as Author, model, effort, worker_id }), 201);
+    const { project, title, description, assignee, model, effort, worker_id, client_id } = req.body as Record<string, string>;
+    guard(res, () => human.create_task({ project, title, description, assignee: assignee as Author, model, effort, worker_id, client_id }), 201);
   });
 
   // Planning mode: one big-brained run that decomposes a goal into board tasks
@@ -221,15 +223,18 @@ export function createApp({ store, bus, dispatcher, readiness, info, agentInfo, 
   });
 
   app.post('/api/tasks/:id/comment', (req, res) => {
-    guard(res, () => human.add_comment({ id: Number(req.params.id), body: String((req.body as { body?: string }).body ?? '') }));
+    const { body, client_id } = req.body as { body?: string; client_id?: string };
+    guard(res, () => human.add_comment({ id: Number(req.params.id), body: String(body ?? ''), client_id }));
   });
 
   app.post('/api/tasks/:id/assign', (req, res) => {
-    guard(res, () => human.assign_task({ id: Number(req.params.id), assignee: (req.body as { assignee: Author }).assignee }));
+    const { assignee, client_id } = req.body as { assignee: Author; client_id?: string };
+    guard(res, () => human.assign_task({ id: Number(req.params.id), assignee, client_id }));
   });
 
   app.post('/api/tasks/:id/status', (req, res) => {
-    guard(res, () => human.update_status({ id: Number(req.params.id), status: (req.body as { status: TaskStatus }).status }));
+    const { status, client_id, expected_status } = req.body as { status: TaskStatus; client_id?: string; expected_status?: TaskStatus };
+    guard(res, () => human.update_status({ id: Number(req.params.id), status, client_id, expected_status }));
   });
 
   app.post('/api/tuning', (req, res) => {

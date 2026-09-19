@@ -135,12 +135,22 @@ details.panel[open] summary { margin-bottom: .6rem; }
 
 const boardScript = `
 const es = new EventSource('/events');
+let bootId;
 let pending = null;
 let refreshing = false;
 let refreshAgain = false;
 const fragments = new Map([...document.querySelectorAll('[data-live]')].map(el => [el.dataset.live, el.innerHTML]));
 function scheduleRefresh() { clearTimeout(pending); pending = setTimeout(refreshPage, 400); }
-es.onmessage = scheduleRefresh;
+es.onmessage = message => {
+  let event;
+  try { event = JSON.parse(message.data); } catch { scheduleRefresh(); return; }
+  if (event?.kind === 'hello') {
+    if (bootId === undefined) bootId = event.bootId;
+    else if (event.bootId && event.bootId !== bootId) location.reload();
+    return;
+  }
+  scheduleRefresh();
+};
 es.onopen = scheduleRefresh; // Refresh on the first open too, since changes can occur between rendering and subscribing.
 async function refreshPage() {
   if (refreshing) { refreshAgain = true; return; }
@@ -187,17 +197,29 @@ async function refreshPage() {
 }
 async function api(path, body) {
   const res = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body ?? {}) });
-  if (!res.ok) { alert(await res.text()); return false; }
+  if (!res.ok) {
+    alert(await res.text());
+    if (res.status === 409) await refreshPage();
+    return false;
+  }
   await refreshPage();
   return true;
+}
+function newId() {
+  return [...crypto.getRandomValues(new Uint8Array(16))].map(byte => byte.toString(16).padStart(2, '0')).join('');
 }
 function submitForm(e, path) {
   e.preventDefault();
   const form = e.target;
   const data = Object.fromEntries(new FormData(form).entries());
+  form.dataset.clientId ??= newId();
+  const body = { ...data, client_id: form.dataset.clientId };
+  const statusSelect = form.querySelector('select[name="status"][data-rendered]');
+  if (statusSelect) body.expected_status = statusSelect.dataset.rendered;
   const buttons = [...form.querySelectorAll('button[type="submit"]')];
   buttons.forEach(button => button.disabled = true);
-  api(path, data).then(ok => {
+  api(path, body).then(ok => {
+    if (ok) delete form.dataset.clientId;
     if (ok && JSON.stringify(Object.fromEntries(new FormData(form).entries())) === JSON.stringify(data)) {
       form.querySelectorAll('textarea, input:not([type="checkbox"]):not([type="hidden"])').forEach(input => input.value = '');
     }

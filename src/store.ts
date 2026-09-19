@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'node:f
 import { dirname, join } from 'node:path';
 import type { Agent, Author, Comment, Project, Run, RunStatus, Task, TaskStatus } from './types.js';
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS projects (
@@ -49,6 +49,15 @@ CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS operations (
+  actor TEXT NOT NULL,
+  client_id TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  body_hash TEXT NOT NULL,
+  result TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (actor, client_id)
+);
 CREATE TABLE IF NOT EXISTS task_deps (
   task_id INTEGER NOT NULL REFERENCES tasks(id),
   depends_on_id INTEGER NOT NULL REFERENCES tasks(id),
@@ -74,6 +83,15 @@ export interface CreateTaskInput {
   model?: string | null;
   effort?: string | null;
   worker_id?: string | null;
+}
+
+export interface Operation {
+  actor: string;
+  client_id: string;
+  operation: string;
+  body_hash: string;
+  result: string;
+  created_at: string;
 }
 
 export interface RemoteLease {
@@ -144,6 +162,15 @@ export class Store {
 
   ping(): void {
     this.db.prepare('SELECT 1').get();
+  }
+
+  getOperation(actor: string, clientId: string): Operation | undefined {
+    return this.db.prepare('SELECT * FROM operations WHERE actor = ? AND client_id = ?').get(actor, clientId) as Operation | undefined;
+  }
+
+  recordOperation(operation: Omit<Operation, 'created_at'>): void {
+    this.db.prepare(`INSERT INTO operations (actor, client_id, operation, body_hash, result)
+      VALUES (@actor, @client_id, @operation, @body_hash, @result)`).run(operation);
   }
 
   serverId(): string {
