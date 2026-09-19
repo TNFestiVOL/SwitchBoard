@@ -63,6 +63,8 @@ const cliLauncher = new CliLauncher({
   claudeMcpConfigPath,
   opencodeMcpConfigPath,
   timeoutMs: config.timeoutMs,
+  authPromptPatterns: config.authPromptPatterns,
+  authGraceMs: config.authGraceMs,
   claudeExtraArgs: config.claudeExtraArgs,
   codexExtraArgs: config.codexExtraArgs,
   geminiExtraArgs: config.geminiExtraArgs,

@@ -30,9 +30,38 @@ function Get-Server {
     return $server
 }
 function Get-State {Invoke-RestMethod "$url/api/state" -TimeoutSec 5}
+function Get-HttpFailure($Failure) {
+    $response=$Failure.Exception.Response
+    $status=0
+    if($response){$status=[int]$response.StatusCode}
+    $body=$Failure.ErrorDetails.Message
+    if(!$body -and $response){
+        try {
+            $reader=[IO.StreamReader]::new($response.GetResponseStream())
+            try {$body=$reader.ReadToEnd()} finally {$reader.Dispose()}
+        }catch {}
+    }
+    $reason=$Failure.Exception.Message
+    if($body){
+        try {
+            $json=$body | ConvertFrom-Json
+            if($json.error){$reason=[string]$json.error}
+        }catch {}
+    }
+    [pscustomobject]@{Status=$status;Reason=($reason -replace '\s+',' ').Trim()}
+}
+$supervisedProcess=$null
 try {
     $server=Get-Server
     if($Action -eq 'Start'){
+        if($server -and $Supervised){
+            $supervisedProcess=Get-Process -Id $server.ProcessId
+            # Retain a handle before exit, including when adopting an existing process.
+            $null=$supervisedProcess.Handle
+            $current=Get-CimInstance Win32_Process -Filter "ProcessId = $($server.ProcessId)"
+            if(!$current -or $current.CreationDate -ne $server.CreationDate){throw 'Server identity changed; refusing to supervise.'}
+            $null=Invoke-RestMethod "$url/health/ready" -TimeoutSec 5
+        }
         if(!$server){
             $node=(Get-Command node.exe).Source
             if(!(Test-Path node_modules/tsx)){throw 'Dependencies missing. Run npm ci in this folder first.'}
@@ -41,6 +70,7 @@ try {
             $stdoutLog=Join-Path $data "production-$stamp.stdout.log"
             $stderrLog=Join-Path $data "production-$stamp.stderr.log"
             $started=Start-Process $node -ArgumentList "--import tsx `"$entry`"" -WorkingDirectory $root -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog
+            if($Supervised){$supervisedProcess=$started;$null=$supervisedProcess.Handle}
             Set-Content -LiteralPath $pidFile $started.Id
             $ready=$false
             for($i=0;$i -lt 30;$i++){
@@ -67,9 +97,21 @@ try {
         }
         Write-Host "Stack ready: $url/ (board, MCP, dispatcher, configured worker listener; paused=$($state.paused), draining=$($state.draining))"
         if(!$NoBrowser){Start-Process "$url/"}
+        if($Supervised){
+            $lock.Dispose()
+            $lock=$null
+            $supervisedProcess.WaitForExit()
+            exit $supervisedProcess.ExitCode
+        }
     }else{
         if(!$server){Write-Host 'Switchboard is already stopped.';return}
-        $null=Invoke-RestMethod "$url/api/drain" -Method Post -TimeoutSec 5
+        try {$null=Invoke-RestMethod "$url/api/drain" -Method Post -TimeoutSec 5}
+        catch {
+            $failure=Get-HttpFailure $_
+            if($failure.Status -eq 404){Write-Host 'Server has no /api/drain (older build); stop it with the previous END or by PID'}
+            else {Write-Host "Host refused drain: $($failure.Reason)"}
+            exit 1
+        }
         $deadline=(Get-Date).AddSeconds($WaitSeconds)
         do {
             $state=Get-State
@@ -81,7 +123,12 @@ try {
         $current=Get-Server
         if(!$current -or $current.ProcessId -ne $server.ProcessId -or $current.CreationDate -ne $server.CreationDate){throw 'Server identity changed; refusing to stop.'}
         $process=Get-Process -Id $server.ProcessId
-        $null=Invoke-RestMethod "$url/api/shutdown" -Method Post -TimeoutSec 5
+        try {$null=Invoke-RestMethod "$url/api/shutdown" -Method Post -TimeoutSec 5}
+        catch {
+            $failure=Get-HttpFailure $_
+            Write-Host "Host refused shutdown: $($failure.Reason)"
+            exit 1
+        }
         if(!$process.WaitForExit(10000)){
             $current=Get-CimInstance Win32_Process -Filter "ProcessId = $($server.ProcessId)"
             if($current -and $current.CreationDate -ne $server.CreationDate){throw 'Server identity changed; refusing to stop.'}
@@ -93,4 +140,7 @@ try {
         Remove-Item -LiteralPath $pidFile -ErrorAction SilentlyContinue
         Write-Host 'Stack stopped. Remote worker processes were left running.'
     }
-}finally{$lock.Dispose()}
+}finally{
+    if($lock){$lock.Dispose()}
+    if($supervisedProcess){$supervisedProcess.Dispose()}
+}

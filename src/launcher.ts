@@ -49,6 +49,8 @@ export interface CliLauncherOpts {
   /** opencode config JSON (switchboard MCP) handed to deepseek runs via OPENCODE_CONFIG. */
   opencodeMcpConfigPath?: string;
   timeoutMs: number;
+  authPromptPatterns?: string[];
+  authGraceMs?: number;
   claudeExtraArgs?: string[];
   codexExtraArgs?: string[];
   geminiExtraArgs?: string[];
@@ -221,7 +223,13 @@ export function extractUsage(lines: string[]): { input: number; output: number; 
 const q = (s: string): string => (/[\s()]/.test(s) ? `"${s}"` : s);
 
 export class CliLauncher implements Launcher {
-  constructor(private opts: CliLauncherOpts) {}
+  private readonly authPatterns: { source: string; regex: RegExp }[];
+  private readonly authGraceMs: number;
+
+  constructor(private opts: CliLauncherOpts) {
+    this.authPatterns = (opts.authPromptPatterns ?? []).map(source => ({ source, regex: new RegExp(source, 'i') }));
+    this.authGraceMs = opts.authGraceMs ?? 90_000;
+  }
 
   launch(agent: Agent, prompt: string, cwd: string, onOutput?: (chunk: string) => void, tuning?: AgentTuning, context?: LaunchContext): Promise<RunResult> {
     if (agent === 'nyx') {
@@ -232,6 +240,7 @@ export class CliLauncher implements Launcher {
       });
     }
     return new Promise(resolve => {
+      const startedAt = Date.now();
       const { cmd, env, args } = buildAgentCommand(agent, this.opts, tuning);
       // Args-array mode (agy): prompt travels as the final spawn argument, no shell —
       // cmd.exe silently mangles multiline quoted arguments.
@@ -249,9 +258,18 @@ export class CliLauncher implements Launcher {
       let settled = false;
 
       const append = (chunk: Buffer | string) => {
+        if (settled) return;
         const text = chunk.toString();
         tail = (tail + text).slice(-TAIL_LIMIT);
         onOutput?.(text);
+        if (!timedOut && Date.now() - startedAt < this.authGraceMs) {
+          const matched = this.authPatterns.find(pattern => pattern.regex.test(tail));
+          if (matched) {
+            tail = `[launcher] CLI needs re-login (matched /${matched.source}/): ${tail}`;
+            killTree();
+            settle(null);
+          }
+        }
       };
 
       child.stdout.on('data', (chunk: Buffer) => {

@@ -8,6 +8,18 @@ process.stdin.on('end', () => {
     setTimeout(() => process.exit(0), 60_000);
     return;
   }
+  if (mode === 'auth-prompt') {
+    setTimeout(() => {
+      if (process.argv[4] === 'split') {
+        process.stdout.write('Please run ');
+        setTimeout(() => process.stderr.write('/login to continue\n'), 50);
+      } else {
+        process.stdout.write('Please run /login to continue\n');
+      }
+      setTimeout(() => process.exit(0), 20_000);
+    }, Number(process.argv[3] ?? 0));
+    return;
+  }
   if (mode === 'fail') {
     process.stderr.write('something exploded\n');
     process.exit(3);

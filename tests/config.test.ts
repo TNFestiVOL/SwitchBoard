@@ -2,7 +2,44 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { resolveWorkerTokens, saveTuning, type Config } from '../src/config.js';
+import { loadConfig, resolveWorkerTokens, saveTuning, type Config } from '../src/config.js';
+
+describe('loadConfig auth detection', () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'sb-auth-config-')); });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it('provides the default re-login patterns and grace window', () => {
+    const config = loadConfig(dir);
+    expect(config.authPromptPatterns).toEqual([
+      'not logged in',
+      'please (run|use) [^\\n]*login',
+      'log ?in (to|and) (continue|try again)',
+      'authentication (required|failed|error)',
+      'invalid (api key|credentials)',
+      '\\b401\\b[^\\n]*unauthorized',
+      'token (has )?expired',
+    ]);
+    expect(config.authGraceMs).toBe(90_000);
+  });
+
+  it('replaces the default re-login pattern list with an override', () => {
+    writeFileSync(join(dir, 'switchboard.config.json'), JSON.stringify({ authPromptPatterns: ['custom auth failure'] }));
+    const config = loadConfig(dir);
+    expect(config.authPromptPatterns).toEqual(['custom auth failure']);
+    expect(config.authGraceMs).toBe(90_000);
+  });
+
+  it('honors an overridden re-login grace window', () => {
+    writeFileSync(join(dir, 'switchboard.config.json'), JSON.stringify({ authGraceMs: 1_234 }));
+    expect(loadConfig(dir).authGraceMs).toBe(1_234);
+  });
+
+  it('allows re-login detection to be disabled with an empty list and zero grace', () => {
+    writeFileSync(join(dir, 'switchboard.config.json'), JSON.stringify({ authPromptPatterns: [], authGraceMs: 0 }));
+    expect(loadConfig(dir)).toMatchObject({ authPromptPatterns: [], authGraceMs: 0 });
+  });
+});
 
 describe('saveTuning', () => {
   let dir: string;

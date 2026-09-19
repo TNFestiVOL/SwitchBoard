@@ -133,7 +133,7 @@ const fakeCli = join(process.cwd(), 'tests', 'fixtures', 'fake-cli.mjs');
 const fakeAgy = join(process.cwd(), 'tests', 'fixtures', 'fake-agy.mjs');
 const fakeOpencode = join(process.cwd(), 'tests', 'fixtures', 'fake-opencode.mjs');
 
-const launcher = (mode: string, timeoutMs = 10_000) => new CliLauncher({
+const launcher = (mode: string, timeoutMs = 10_000, opts: Partial<CliLauncherOpts> = {}) => new CliLauncher({
   claudeCmd: `node ${fakeCli} ${mode}`,
   codexCmd: `node ${fakeCli} ${mode}`,
   geminiCmd: 'agy',
@@ -141,7 +141,13 @@ const launcher = (mode: string, timeoutMs = 10_000) => new CliLauncher({
   claudeMcpConfigPath: 'unused.json',
   timeoutMs,
   rawCommands: true, // test hook: use cmd string verbatim, no default args
+  ...opts,
 });
+
+const authOpts = {
+  authPromptPatterns: ['please (run|use) [^\\n]*login'],
+  authGraceMs: 90_000,
+};
 
 describe('extractUsage', () => {
   it('reads claude result-line usage and cost', () => {
@@ -194,6 +200,44 @@ describe('extractUsage', () => {
 });
 
 describe('CliLauncher', () => {
+  it('fails fast on an early re-login prompt for every CLI agent', async () => {
+    const cmd = `node ${fakeCli} auth-prompt`;
+    const instance = launcher('auth-prompt', 30_000, { ...authOpts, geminiCmd: cmd, deepseekCmd: cmd });
+    const started = Date.now();
+    const results = await Promise.all((['claude', 'codex', 'gemini', 'deepseek'] as const)
+      .map(agent => instance.launch(agent, 'x', process.cwd())));
+    expect(Date.now() - started).toBeLessThan(3_000);
+    for (const result of results) {
+      expect(result).toMatchObject({ ok: false, timedOut: false, exitCode: null });
+      expect(result.outputTail.startsWith(`[launcher] CLI needs re-login (matched /${authOpts.authPromptPatterns[0]}/): `)).toBe(true);
+      expect(result.outputTail).toContain('Please run /login to continue');
+    }
+  }, 5_000);
+
+  it('detects a re-login prompt split across output streams', async () => {
+    const chunks: string[] = [];
+    const result = await launcher('auth-prompt 0 split', 30_000, authOpts)
+      .launch('claude', 'x', process.cwd(), chunk => chunks.push(chunk));
+    expect(result).toMatchObject({ ok: false, timedOut: false, exitCode: null });
+    expect(result.outputTail).toBe(`[launcher] CLI needs re-login (matched /${authOpts.authPromptPatterns[0]}/): Please run /login to continue\n`);
+    expect(chunks.join('')).toBe('Please run /login to continue\n');
+  }, 5_000);
+
+  it('lets a re-login prompt after the grace window run to normal completion', async () => {
+    const started = Date.now();
+    const result = await launcher('auth-prompt 100', 30_000, { ...authOpts, authGraceMs: 1 })
+      .launch('claude', 'x', process.cwd());
+    expect(Date.now() - started).toBeGreaterThanOrEqual(20_000);
+    expect(result).toMatchObject({ ok: true, timedOut: false, exitCode: 0 });
+    expect(result.outputTail).toBe('Please run /login to continue\n');
+  }, 30_000);
+
+  it('preserves normal success with re-login detection enabled', async () => {
+    const result = await launcher('ok', 10_000, authOpts).launch('claude', 'x', process.cwd());
+    expect(result).toMatchObject({ ok: true, timedOut: false, exitCode: 0, inputTokens: 900, outputTokens: 400 });
+    expect(result.outputTail).not.toContain('[launcher] CLI needs re-login');
+  });
+
   it('runs to success, parses usage, streams output', async () => {
     const chunks: string[] = [];
     const result = await launcher('ok').launch('claude', 'do the thing', process.cwd(), c => chunks.push(c));

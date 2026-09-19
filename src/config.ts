@@ -12,6 +12,8 @@ export interface Config {
   dbPath: string;
   bounceCap: number;
   timeoutMs: number;
+  authPromptPatterns: string[];
+  authGraceMs: number;
   sweepMs: number;
   budgets: Record<Agent, { soft: number; hard: number }>;
   claudeCmd: string;
@@ -101,6 +103,16 @@ const defaults = (root: string): Config => ({
   dbPath: join(root, 'data', 'switchboard.db'),
   bounceCap: 6,
   timeoutMs: 15 * 60_000,
+  authPromptPatterns: [
+    'not logged in', // Unverified: no captured CLI output for this pattern.
+    'please (run|use) [^\\n]*login', // Unverified: no captured CLI output for this pattern.
+    'log ?in (to|and) (continue|try again)', // Unverified: no captured CLI output for this pattern.
+    'authentication (required|failed|error)', // Unverified: no captured CLI output for this pattern.
+    'invalid (api key|credentials)', // Unverified: no captured CLI output for this pattern.
+    '\\b401\\b[^\\n]*unauthorized', // Unverified: no captured CLI output for this pattern.
+    'token (has )?expired', // Unverified: no captured CLI output for this pattern.
+  ],
+  authGraceMs: 90_000,
   sweepMs: 15_000,
   budgets: perAgent({ soft: 0, hard: 0 }),
   claudeCmd: 'claude',
