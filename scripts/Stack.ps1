@@ -46,7 +46,7 @@ try {
             for($i=0;$i -lt 30;$i++){
                 $started.Refresh()
                 if($started.HasExited){throw "Server exited. See $stderrLog."}
-                try {$null=Get-State;$ready=$true;break} catch {Start-Sleep -Milliseconds 500}
+                try {$null=Invoke-RestMethod "$url/health/ready" -TimeoutSec 5;$ready=$true;break} catch {Start-Sleep -Milliseconds 500}
             }
             if(!$ready){throw 'Startup not ready. Check production logs before retrying.'}
             $server=Get-Server

@@ -1,5 +1,10 @@
 import Database from 'better-sqlite3';
+import { randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import type { Agent, Author, Comment, Project, Run, RunStatus, Task, TaskStatus } from './types.js';
+
+export const SCHEMA_VERSION = 1;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS projects (
@@ -92,10 +97,37 @@ export class Store {
   private db: Database.Database;
 
   constructor(path: string) {
+    const existed = path !== ':memory:' && existsSync(path);
     this.db = new Database(path);
-    if (path !== ':memory:') this.db.pragma('journal_mode = WAL');
-    this.db.exec(SCHEMA);
-    this.migrate();
+    try {
+      if (path !== ':memory:') this.db.pragma('journal_mode = WAL');
+      const current = this.db.pragma('user_version', { simple: true }) as number;
+      if (existed && current < SCHEMA_VERSION) this.backup(path);
+      this.db.exec(SCHEMA);
+      this.migrate();
+      this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
+  }
+
+  private backup(path: string): void {
+    const directory = join(dirname(path), 'backups');
+    mkdirSync(directory, { recursive: true });
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:]/g, '').replace('T', '-');
+    const stem = join(directory, `switchboard-${stamp}`);
+    let target = `${stem}.db`;
+    for (let suffix = 2; existsSync(target); suffix++) target = `${stem}-${suffix}.db`;
+    this.db.prepare('VACUUM INTO ?').run(target);
+
+    const previous = readdirSync(directory, { withFileTypes: true })
+      .filter(entry => entry.isFile() && /^switchboard-\d{8}-\d{6}(?:-\d+)?\.db$/.test(entry.name))
+      .map(entry => join(directory, entry.name))
+      .filter(file => file !== target)
+      .map(file => ({ file, modified: statSync(file).mtimeMs }))
+      .sort((a, b) => b.modified - a.modified);
+    for (const { file } of previous.slice(9)) unlinkSync(file);
   }
 
   /** Additive migrations for databases created by older versions. */
@@ -108,6 +140,20 @@ export class Store {
 
   close(): void {
     this.db.close();
+  }
+
+  ping(): void {
+    this.db.prepare('SELECT 1').get();
+  }
+
+  serverId(): string {
+    return this.db.transaction(() => {
+      const existing = this.getSetting('server_id', '');
+      if (existing) return existing;
+      const id = randomUUID();
+      this.setSetting('server_id', id);
+      return id;
+    }).immediate();
   }
 
   // --- projects ---

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import request from 'supertest';
-import type { Request, Response } from 'express';
+import express, { type Request, type Response } from 'express';
 import type { Server } from 'node:http';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -96,6 +96,100 @@ describe('server', () => {
     else resolve();
     httpServer = undefined;
   }));
+
+  it('reports liveness without touching storage or readiness', async () => {
+    const closedStore = new Store(':memory:');
+    const readiness = vi.fn(() => ({ ok: false as const, reason: 'unavailable' }));
+    const liveApp = createApp({ store: closedStore, bus: new EventBus(), dispatcher, readiness });
+    closedStore.close();
+
+    const res = await request(liveApp).get('/health/live');
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true });
+    expect(res.headers['cache-control']).toBe('no-store');
+    expect(readiness).not.toHaveBeenCalled();
+  });
+
+  it('reports readiness with default dependencies and disables caching', async () => {
+    const res = await request(app).get('/health/ready');
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true });
+    expect(res.headers['cache-control']).toBe('no-store');
+  });
+
+  it('reports the worker readiness reason and rechecks it on each request', async () => {
+    const readiness = vi.fn<() => { ok: true } | { ok: false; reason: string }>()
+      .mockReturnValueOnce({ ok: false, reason: 'worker listener on 4781 is not bound' })
+      .mockReturnValue({ ok: true });
+    const readyApp = createApp({ store, bus: new EventBus(), dispatcher, readiness });
+
+    const unavailable = await request(readyApp).get('/health/ready');
+    const available = await request(readyApp).get('/health/ready');
+
+    expect(unavailable.status).toBe(503);
+    expect(unavailable.body).toEqual({ ok: false, reason: 'worker listener on 4781 is not bound' });
+    expect(unavailable.headers['cache-control']).toBe('no-store');
+    expect(available.status).toBe(200);
+    expect(available.body).toEqual({ ok: true });
+    expect(readiness).toHaveBeenCalledTimes(2);
+  });
+
+  it('reports closed storage before checking worker readiness', async () => {
+    const closedStore = new Store(':memory:');
+    const readiness = vi.fn(() => ({ ok: true as const }));
+    const readyApp = createApp({ store: closedStore, bus: new EventBus(), dispatcher, readiness });
+    closedStore.close();
+
+    const res = await request(readyApp).get('/health/ready');
+
+    expect(res.status).toBe(503);
+    expect(res.body).toEqual({ ok: false, reason: expect.stringMatching(/^storage: .+/) });
+    expect(res.headers['cache-control']).toBe('no-store');
+    expect(readiness).not.toHaveBeenCalled();
+  });
+
+  it('returns only stable server identity and supplied public host information', async () => {
+    const infoApp = createApp({
+      store, bus: new EventBus(), dispatcher,
+      info: { version: '1.2.3', bootId: 'boot-for-test' },
+    });
+
+    const first = await request(infoApp).get('/api/info');
+    const second = await request(infoApp).get('/api/info');
+
+    expect(first.status).toBe(200);
+    expect(first.body).toEqual({
+      serverId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      version: '1.2.3', bootId: 'boot-for-test', apiVersion: 1,
+    });
+    expect(second.status).toBe(200);
+    expect(second.body).toEqual(first.body);
+  });
+
+  it('uses default version and boot identity when host information is omitted', async () => {
+    const res = await request(app).get('/api/info');
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      serverId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      version: '0.0.0', bootId: '', apiVersion: 1,
+    });
+  });
+
+  it.each(['/health/live', '/health/ready', '/api/info'])('serves %s to LAN sockets before JSON parsing', async path => {
+    const lanApp = express();
+    lanApp.use((req, _res, next) => {
+      Object.defineProperty(req.socket, 'remoteAddress', { value: '192.0.2.20' });
+      next();
+    });
+    lanApp.use(app);
+
+    const res = await request(lanApp).get(path).set('Content-Type', 'application/json').send('{invalid');
+
+    expect(res.status).toBe(200);
+  });
 
   it('renders the board with tasks and columns', async () => {
     store.createTask({ project_id: 1, title: 'Very Visible Task', description: '', assignee: 'human', created_by: 'human', status: 'inbox' });

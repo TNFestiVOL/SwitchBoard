@@ -1,4 +1,5 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { loadConfig, resolveWorkerTokens, saveTuning } from './config.js';
 import { Store } from './store.js';
@@ -14,6 +15,8 @@ import { WorktreeManager } from './worktrees.js';
 import { RemoteCoordinator } from './remote.js';
 
 const root = process.cwd();
+const bootId = randomUUID();
+const version = (JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as { version: string }).version;
 const config = loadConfig(root);
 
 // Load the repo .env (if present) into the environment WITHOUT overriding real
@@ -99,12 +102,13 @@ dispatcher.recoverOrphans({ remoteEnabled: !!config.remote });
 
 const workerTokens = config.remote ? resolveWorkerTokens(config.remote.tokenEnv) : { tokens: {}, problems: [] };
 for (const problem of workerTokens.problems) console.warn(`[remote] ${problem}`);
-if (config.remote) {
+const remoteServer = (() => {
+  if (!config.remote) return;
   const remote = new RemoteCoordinator(store, bus, dispatcher, { tokens: workerTokens.tokens, bounceCap: config.bounceCap });
   remote.expire();
   setInterval(() => remote.expire(), 5000);
-  remote.app.listen(config.remote.port, config.remote.host ?? '0.0.0.0', () => console.log(`Worker listener on port ${config.remote!.port}`));
-}
+  return remote.app.listen(config.remote.port, config.remote.host ?? '0.0.0.0', () => console.log(`Worker listener on port ${config.remote!.port}`));
+})();
 
 // Persist tuning changes from the UI back into switchboard.config.json,
 // preserving whatever else the user has in there.
@@ -118,6 +122,10 @@ const app = createApp({
   store, bus, dispatcher, agentInfo: config.tuning, modelChoices: config.modelChoices, machines,
   persistTuning: () => saveTuning(configPath, config.tuning),
   workers: new Set(Object.keys(workerTokens.tokens)),
+  readiness: () => config.remote && !remoteServer?.listening
+    ? { ok: false, reason: `worker listener on ${config.remote.port} is not bound` }
+    : { ok: true },
+  info: { version, bootId },
 });
 app.listen(config.port, '0.0.0.0', () => {
   console.log(`

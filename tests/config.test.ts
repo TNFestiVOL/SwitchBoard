@@ -26,6 +26,16 @@ describe('saveTuning', () => {
     expect(existsSync(configPath + '.tmp')).toBe(false);
   });
 
+  it.each(['[]', 'null', 'true', '42', '"text"'])('leaves non-object JSON %s byte-for-byte intact without creating a temporary file', json => {
+    const original = Buffer.from(` \r\n${json}\r\n`);
+    writeFileSync(configPath, original);
+
+    expect(() => saveTuning(configPath, tuning)).toThrow(new Error('switchboard.config.json must contain a JSON object; tuning not saved'));
+
+    expect(readFileSync(configPath)).toEqual(original);
+    expect(existsSync(configPath + '.tmp')).toBe(false);
+  });
+
   it('preserves every other configuration key when saving tuning', () => {
     const original = {
       machines: [{ workerId: 'amber', name: 'Worker', ip: '192.0.2.10' }],

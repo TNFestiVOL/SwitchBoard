@@ -50,6 +50,9 @@ export function saveTuning(configPath: string, tuning: Config['tuning']): void {
     }
     if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
   }
+  if (existing === null || typeof existing !== 'object' || Array.isArray(existing)) {
+    throw new Error('switchboard.config.json must contain a JSON object; tuning not saved');
+  }
   existing.tuning = tuning;
   writeFileSync(configPath + '.tmp', JSON.stringify(existing, null, 2) + '\n');
   renameSync(configPath + '.tmp', configPath);

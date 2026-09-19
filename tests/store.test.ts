@@ -1,5 +1,152 @@
-import { describe, it, expect, beforeEach } from 'vitest';
-import { Store } from '../src/store.js';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import Database from 'better-sqlite3';
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { SCHEMA_VERSION, Store } from '../src/store.js';
+
+describe('Store host contract', () => {
+  let dir: string;
+  let path: string;
+  const handles: { close(): void }[] = [];
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'sb-store-'));
+    path = join(dir, 'switchboard.db');
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    for (const handle of handles.splice(0).reverse()) handle.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function openStore(dbPath = path): Store {
+    const store = new Store(dbPath);
+    handles.push(store);
+    return store;
+  }
+
+  function openDatabase(dbPath = path): Database.Database {
+    const db = new Database(dbPath);
+    handles.push(db);
+    return db;
+  }
+
+  function legacyDatabase(): Database.Database {
+    const db = openDatabase();
+    db.pragma('journal_mode = WAL');
+    db.exec("CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL); INSERT INTO tasks VALUES (1, 'Before migration')");
+    return db;
+  }
+
+  function backups(): string[] {
+    return readdirSync(join(dir, 'backups')).filter(name => /^switchboard-\d{8}-\d{6}(?:-\d+)?\.db$/.test(name));
+  }
+
+  it('backs up an existing unversioned database before migration, including WAL data', () => {
+    const legacy = legacyDatabase();
+    openStore();
+
+    expect(backups()).toHaveLength(1);
+    const backup = openDatabase(join(dir, 'backups', backups()[0]));
+    expect(backup.prepare('SELECT * FROM tasks').all()).toEqual([{ id: 1, title: 'Before migration' }]);
+    expect(backup.pragma('table_info(tasks)')).not.toEqual(expect.arrayContaining([expect.objectContaining({ name: 'model' })]));
+    expect(backup.pragma('user_version', { simple: true })).toBe(0);
+    expect(backup.pragma('integrity_check', { simple: true })).toBe('ok');
+    expect(SCHEMA_VERSION).toBe(1);
+    expect(legacy.pragma('user_version', { simple: true })).toBe(SCHEMA_VERSION);
+    expect(legacy.pragma('table_info(tasks)')).toEqual(expect.arrayContaining([expect.objectContaining({ name: 'model' })]));
+  });
+
+  it('does not create another backup when reopening the current schema version', () => {
+    legacyDatabase().close();
+    openStore().close();
+    const first = backups();
+    expect(first).toHaveLength(1);
+
+    openStore();
+
+    expect(backups()).toEqual(first);
+  });
+
+  it('stamps a brand-new database without creating a backups directory', () => {
+    openStore();
+
+    expect(openDatabase().pragma('user_version', { simple: true })).toBe(SCHEMA_VERSION);
+    expect(existsSync(join(dir, 'backups'))).toBe(false);
+  });
+
+  it('stamps an in-memory database without writing a backup', () => {
+    const store = openStore(':memory:');
+
+    expect(store['db'].pragma('user_version', { simple: true })).toBe(SCHEMA_VERSION);
+    expect(store['db'].pragma('database_list')).toEqual([expect.objectContaining({ name: 'main', file: '' })]);
+    expect(readdirSync(dir)).toEqual([]);
+    const vacuum = vi.spyOn(Database.prototype, 'prepare');
+    try {
+      openStore(':memory:');
+      expect(vacuum.mock.calls.some(([sql]) => /VACUUM/i.test(sql))).toBe(false);
+    } finally {
+      vacuum.mockRestore();
+    }
+  });
+
+  it('pings while open and throws after close', () => {
+    const store = openStore();
+    expect(() => store.ping()).not.toThrow();
+    store.close();
+    expect(() => store.ping()).toThrow();
+  });
+
+  it('persists a stable server UUID across calls and reopening', () => {
+    const store = openStore();
+    const id = store.serverId();
+    expect(id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(store.serverId()).toBe(id);
+    expect(store.getSetting('server_id', '')).toBe(id);
+    store.close();
+
+    expect(openStore().serverId()).toBe(id);
+  });
+
+  it('preserves colliding backup names and retains the newest ten snapshots', () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-09-19T12:34:56Z'));
+    const legacy = legacyDatabase();
+    openStore().close();
+    const first = backups()[0];
+    const stem = first.replace(/\.db$/, '');
+    const unrelated = join(dir, 'backups', 'manual.db');
+    writeFileSync(unrelated, 'keep me');
+
+    for (let n = 2; n <= 12; n++) {
+      const previous = backups();
+      legacy.pragma('user_version = 0');
+      legacy.prepare('UPDATE tasks SET title = ?').run(`Snapshot ${n}`);
+      openStore().close();
+      const added = backups().filter(name => !previous.includes(name));
+      expect(added).toHaveLength(1);
+      const backup = openDatabase(join(dir, 'backups', added[0]));
+      expect(backup.prepare('SELECT title FROM tasks').get()).toEqual({ title: `Snapshot ${n}` });
+      backup.close();
+      if (n === 2) {
+        expect(added[0]).toBe(`${stem}-2.db`);
+        const original = openDatabase(join(dir, 'backups', first));
+        expect(original.prepare('SELECT title FROM tasks').get()).toEqual({ title: 'Before migration' });
+        original.close();
+      }
+    }
+
+    expect(backups()).toHaveLength(10);
+    const titles = backups().map(name => {
+      const backup = openDatabase(join(dir, 'backups', name));
+      return (backup.prepare('SELECT title FROM tasks').get() as { title: string }).title;
+    });
+    expect(titles.sort()).toEqual(Array.from({ length: 10 }, (_, i) => `Snapshot ${i + 3}`).sort());
+    expect(existsSync(unrelated)).toBe(true);
+  });
+});
 
 describe('Store', () => {
   let store: Store;

@@ -19,6 +19,8 @@ export interface AppDeps {
   store: Store;
   bus: EventBus;
   dispatcher: Dispatcher;
+  readiness?: () => { ok: true } | { ok: false; reason: string };
+  info?: { version: string; bootId: string };
   /** Per-agent model/effort from config, shown in the UI header. Mutated in place by /api/tuning. */
   agentInfo?: Partial<Record<Agent, { model?: string; effort?: string }>>;
   /** Called after tuning changes so the host can write switchboard.config.json. */
@@ -43,7 +45,7 @@ export const mcpLoopbackGuard: express.RequestHandler = (req, res, next) => {
   next();
 };
 
-export function createApp({ store, bus, dispatcher, agentInfo, persistTuning, modelChoices, machines, workers }: AppDeps): express.Express {
+export function createApp({ store, bus, dispatcher, readiness, info, agentInfo, persistTuning, modelChoices, machines, workers }: AppDeps): express.Express {
   const app = express();
   const human = toolHandlers(store, bus, 'human', { workers });
   // Preserve the caller's nested tuning objects (the UI mutates them in place),
@@ -96,6 +98,35 @@ export function createApp({ store, bus, dispatcher, agentInfo, persistTuning, mo
     req.on('close', () => {
       clearInterval(heartbeat);
       bus.offChange(onChange);
+    });
+  });
+
+  app.get('/health/live', (_req, res) => {
+    res.set('Cache-Control', 'no-store').json({ ok: true });
+  });
+
+  app.get('/health/ready', (_req, res) => {
+    res.set('Cache-Control', 'no-store');
+    try {
+      store.ping();
+    } catch (error) {
+      res.status(503).json({ ok: false, reason: `storage: ${error instanceof Error ? error.message : String(error)}` });
+      return;
+    }
+    const ready = readiness?.();
+    if (ready && !ready.ok) {
+      res.status(503).json({ ok: false, reason: ready.reason });
+      return;
+    }
+    res.json({ ok: true });
+  });
+
+  app.get('/api/info', (_req, res) => {
+    res.json({
+      serverId: store.serverId(),
+      version: info?.version ?? '0.0.0',
+      bootId: info?.bootId ?? '',
+      apiVersion: 1,
     });
   });
 
