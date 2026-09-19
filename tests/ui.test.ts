@@ -91,9 +91,14 @@ describe('live refresh script', () => {
     expect(html).toContain('input:not([type="checkbox"]):not([type="hidden"])');
   });
 
-  it('only catches up on SSE reconnects and only polls output on task pages', () => {
+  it('refreshes on every SSE open including the first', () => {
     const html = renderBoard(board([]));
-    expect(html).toContain('if (connected) scheduleRefresh()');
+    expect(html).toContain('es.onopen = scheduleRefresh');
+    expect(html).not.toContain('if (connected)');
+  });
+
+  it('only polls output on task pages', () => {
+    const html = renderBoard(board([]));
     expect(html).toContain("if (location.pathname.startsWith('/task/')) pollOutput();");
   });
 });

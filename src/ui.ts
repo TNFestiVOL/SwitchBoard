@@ -140,9 +140,8 @@ let refreshing = false;
 let refreshAgain = false;
 const fragments = new Map([...document.querySelectorAll('[data-live]')].map(el => [el.dataset.live, el.innerHTML]));
 function scheduleRefresh() { clearTimeout(pending); pending = setTimeout(refreshPage, 400); }
-let connected = false;
 es.onmessage = scheduleRefresh;
-es.onopen = () => { if (connected) scheduleRefresh(); connected = true; }; // catch up after a reconnect
+es.onopen = scheduleRefresh; // Refresh on the first open too, since changes can occur between rendering and subscribing.
 async function refreshPage() {
   if (refreshing) { refreshAgain = true; return; }
   refreshing = true;

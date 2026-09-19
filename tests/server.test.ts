@@ -1,12 +1,13 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import request from 'supertest';
+import type { Request, Response } from 'express';
 import type { Server } from 'node:http';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { Store } from '../src/store.js';
 import { EventBus } from '../src/events.js';
 import { Dispatcher } from '../src/dispatcher.js';
-import { createApp } from '../src/server.js';
+import { createApp, isLoopbackAddress, mcpLoopbackGuard } from '../src/server.js';
 import type { Launcher, RunResult } from '../src/launcher.js';
 
 class IdleLauncher implements Launcher {
@@ -14,6 +15,64 @@ class IdleLauncher implements Launcher {
     return new Promise(() => { /* never resolves — keeps runs visible as active */ });
   }
 }
+
+describe('MCP loopback guard', () => {
+  it('recognizes only loopback socket addresses', () => {
+    const cases: [string | undefined, boolean][] = [
+      ['127.0.0.1', true],
+      ['127.23.45.67', true],
+      ['127.255.255.255', true],
+      ['::1', true],
+      ['::ffff:127.0.0.1', true],
+      ['::ffff:127.23.45.67', true],
+      ['192.0.2.10', false],
+      ['::ffff:192.0.2.10', false],
+      ['10.0.0.1', false],
+      [undefined, false],
+      ['localhost', false],
+      ['127.0.0.999', false],
+      ['127.0.0.1.example', false],
+    ];
+    for (const [address, expected] of cases) {
+      expect(isLoopbackAddress(address), String(address)).toBe(expected);
+    }
+  });
+
+  it('rejects a LAN socket even when forwarding headers claim loopback', () => {
+    const req = {
+      socket: { remoteAddress: '192.0.2.20' },
+      headers: { 'x-forwarded-for': '127.0.0.1', forwarded: 'for="[::1]"' },
+    } as unknown as Request;
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() };
+    const next = vi.fn();
+
+    mcpLoopbackGuard(req, res as unknown as Response, next);
+
+    expect(res.status).toHaveBeenCalledTimes(1);
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(res.json).toHaveBeenCalledTimes(1);
+    expect(res.json).toHaveBeenCalledWith({
+      error: 'MCP identities are accepted from this machine only. Remote workers use the worker listener.',
+    });
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('allows a loopback socket without sending a response', () => {
+    const req = {
+      socket: { remoteAddress: '127.0.0.1' },
+      headers: { 'x-forwarded-for': '192.0.2.20' },
+    } as unknown as Request;
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() };
+    const next = vi.fn();
+
+    mcpLoopbackGuard(req, res as unknown as Response, next);
+
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(next).toHaveBeenCalledWith();
+    expect(res.status).not.toHaveBeenCalled();
+    expect(res.json).not.toHaveBeenCalled();
+  });
+});
 
 describe('server', () => {
   let store: Store;
@@ -185,6 +244,31 @@ describe('server', () => {
     const tunedState = await request(app2).get('/api/state');
     expect(tunedState.body.agents.gemini.model).toBe('gemini-3.1-pro-high');
     expect((await request(app2).post('/api/tuning').send({ agent: 'bogus', model: 'x' })).status).toBe(400);
+  });
+
+  it.each([
+    { label: 'existing values', previous: { model: 'old', effort: 'high' } },
+    { label: 'defaults', previous: {} },
+  ])('restores tuning $label without emitting a change when persistence fails', async ({ previous }) => {
+    const target = { ...previous };
+    const agentInfo = { codex: target };
+    const bus2 = new EventBus();
+    const changes = vi.fn();
+    bus2.onChange(changes);
+    const d2 = new Dispatcher(store, new IdleLauncher(), bus2, { budgets: {}, bounceCap: 6 });
+    const persistTuning = vi.fn(() => { throw new Error('tuning could not be saved'); });
+    const app2 = createApp({ store, bus: bus2, dispatcher: d2, agentInfo, persistTuning });
+
+    const res = await request(app2).post('/api/tuning').send({ agent: 'codex', model: 'x' });
+    const state = await request(app2).get('/api/state');
+
+    expect(res.status).toBe(500);
+    expect(state.body.agents.codex).toEqual(previous);
+    expect(agentInfo.codex).toBe(target);
+    expect(target).toStrictEqual(previous);
+    expect(res.body).toEqual({ error: 'tuning could not be saved' });
+    expect(persistTuning).toHaveBeenCalledTimes(1);
+    expect(changes).not.toHaveBeenCalled();
   });
 
   it('pauses and resumes dispatch', async () => {

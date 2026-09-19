@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { loadConfig, resolveWorkerTokens } from './config.js';
+import { loadConfig, resolveWorkerTokens, saveTuning } from './config.js';
 import { Store } from './store.js';
 import { EventBus } from './events.js';
 import { CliLauncher } from './launcher.js';
@@ -109,21 +109,14 @@ if (config.remote) {
 // Persist tuning changes from the UI back into switchboard.config.json,
 // preserving whatever else the user has in there.
 const configPath = join(root, 'switchboard.config.json');
-const persistTuning = (): void => {
-  let existing: Record<string, unknown> = {};
-  try {
-    existing = JSON.parse(readFileSync(configPath, 'utf8'));
-  } catch { /* no config file yet — create one */ }
-  existing.tuning = config.tuning;
-  writeFileSync(configPath, JSON.stringify(existing, null, 2) + '\n');
-};
 
 const machines = (config.machines ?? [{ workerId: null, name: 'This PC', ip: '127.0.0.1' }]).map(pc => ({
   ...pc,
   configured: pc.workerId === null || Object.hasOwn(workerTokens.tokens, pc.workerId),
 }));
 const app = createApp({
-  store, bus, dispatcher, agentInfo: config.tuning, persistTuning, modelChoices: config.modelChoices, machines,
+  store, bus, dispatcher, agentInfo: config.tuning, modelChoices: config.modelChoices, machines,
+  persistTuning: () => saveTuning(configPath, config.tuning),
   workers: new Set(Object.keys(workerTokens.tokens)),
 });
 app.listen(config.port, '0.0.0.0', () => {

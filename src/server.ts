@@ -1,5 +1,6 @@
 import express from 'express';
 import { mkdirSync } from 'node:fs';
+import { isIP } from 'node:net';
 import { join } from 'node:path';
 import type { Store } from './store.js';
 import type { EventBus } from './events.js';
@@ -27,6 +28,20 @@ export interface AppDeps {
 }
 
 const MCP_ACTORS = new Set<Author>([...AGENTS, 'human']);
+
+export function isLoopbackAddress(addr: string | undefined): boolean {
+  if (addr === '::1') return true;
+  const ipv4 = addr?.replace(/^::ffff:/i, '');
+  return ipv4 !== undefined && isIP(ipv4) === 4 && ipv4.startsWith('127.');
+}
+
+export const mcpLoopbackGuard: express.RequestHandler = (req, res, next) => {
+  if (!isLoopbackAddress(req.socket.remoteAddress)) {
+    res.status(403).json({ error: 'MCP identities are accepted from this machine only. Remote workers use the worker listener.' });
+    return;
+  }
+  next();
+};
 
 export function createApp({ store, bus, dispatcher, agentInfo, persistTuning, modelChoices, machines, workers }: AppDeps): express.Express {
   const app = express();
@@ -93,6 +108,7 @@ export function createApp({ store, bus, dispatcher, agentInfo, persistTuning, mo
   });
 
   // --- MCP endpoint (identity from path) ---
+  app.use('/mcp', mcpLoopbackGuard);
   app.all('/mcp/:agent', (req, res) => {
     const agent = req.params.agent as Author;
     if (!MCP_ACTORS.has(agent)) {
@@ -195,11 +211,20 @@ export function createApp({ store, bus, dispatcher, agentInfo, persistTuning, mo
     // so the change applies to the very next dispatched run.
     const selectedAgent = agent as Agent;
     const target = tuning[selectedAgent];
+    const previous = { ...target };
     delete target.model;
     delete target.effort;
     if (model?.trim()) target.model = model.trim();
     if (effort?.trim()) target.effort = effort.trim();
-    persistTuning?.();
+    try {
+      persistTuning?.();
+    } catch (e) {
+      delete target.model;
+      delete target.effort;
+      Object.assign(target, previous);
+      res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
+      return;
+    }
     bus.change({ kind: 'tuning_changed' });
     res.json({ agent: selectedAgent, tuning: target });
   });

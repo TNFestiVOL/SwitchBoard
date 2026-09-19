@@ -37,23 +37,31 @@ try {
             $node=(Get-Command node.exe).Source
             if(!(Test-Path node_modules/tsx)){throw 'Dependencies missing. Run npm ci in this folder first.'}
             if($config.remote -and @(Get-NetTCPConnection -State Listen | Where-Object LocalPort -eq $config.remote.port).Count){throw 'Worker listener port is occupied.'}
-            $started=Start-Process $node -ArgumentList "--import tsx `"$entry`"" -WorkingDirectory $root -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $data 'production.stdout.log') -RedirectStandardError (Join-Path $data 'production.stderr.log')
+            $stamp=Get-Date -Format 'yyyyMMdd-HHmmss'
+            $stdoutLog=Join-Path $data "production-$stamp.stdout.log"
+            $stderrLog=Join-Path $data "production-$stamp.stderr.log"
+            $started=Start-Process $node -ArgumentList "--import tsx `"$entry`"" -WorkingDirectory $root -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog
             Set-Content -LiteralPath $pidFile $started.Id
             $ready=$false
             for($i=0;$i -lt 30;$i++){
                 $started.Refresh()
-                if($started.HasExited){throw 'Server exited. See data/production.stderr.log.'}
+                if($started.HasExited){throw "Server exited. See $stderrLog."}
                 try {$null=Get-State;$ready=$true;break} catch {Start-Sleep -Milliseconds 500}
             }
             if(!$ready){throw 'Startup not ready. Check production logs before retrying.'}
             $server=Get-Server
+            $null=Invoke-RestMethod "$url/api/resume" -Method Post -TimeoutSec 5
         }
         $null=Get-State
         if($config.remote){
             $listeners=@(Get-NetTCPConnection -State Listen | Where-Object {$_.LocalPort -eq $config.remote.port -and $_.OwningProcess -eq $server.ProcessId})
             if(!$listeners.Count){throw 'Board is up but worker listener is not ready. Check production logs.'}
         }
-        $null=Invoke-RestMethod "$url/api/resume" -Method Post -TimeoutSec 5
+        foreach($stream in @('stdout','stderr')){
+            Get-ChildItem -LiteralPath $data -Filter "production-*.$stream.log" -File |
+                Sort-Object Name -Descending | Select-Object -Skip 10 |
+                ForEach-Object {Remove-Item -LiteralPath $_.FullName}
+        }
         Write-Host "Stack ready: $url/ (board, MCP, dispatcher, configured worker listener)"
         if(!$NoBrowser){Start-Process "$url/"}
     }else{

@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { AGENTS, type Agent } from './types.js';
@@ -38,6 +38,21 @@ export interface Config {
   /** Concurrent runs per agent (default 1 each). e.g. { "codex": 2 } spawns two codex instances. */
   agentConcurrency: Record<Agent, number>;
   agents: { nyx: NyxAgentConfig };
+}
+
+export function saveTuning(configPath: string, tuning: Config['tuning']): void {
+  let existing: Record<string, unknown> = {};
+  try {
+    existing = JSON.parse(readFileSync(configPath, 'utf8'));
+  } catch (e) {
+    if (e instanceof SyntaxError) {
+      throw new Error('switchboard.config.json is not valid JSON; tuning not saved');
+    }
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+  }
+  existing.tuning = tuning;
+  writeFileSync(configPath + '.tmp', JSON.stringify(existing, null, 2) + '\n');
+  renameSync(configPath + '.tmp', configPath);
 }
 
 /** Resolve worker credentials from the environment. Missing or short tokens are reported, never fatal. */
