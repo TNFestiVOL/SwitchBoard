@@ -8,6 +8,8 @@ export interface NyxAgentConfig {
   token?: string;
   /** Delay between status polls. Defaults to 250 ms. */
   pollIntervalMs?: number;
+  /** Time allowed to cancel and confirm termination. Defaults to 30,000 ms. */
+  cancelGraceMs?: number;
 }
 
 export interface NyxLauncherOpts extends NyxAgentConfig {
@@ -18,9 +20,17 @@ export interface NyxLauncherOpts extends NyxAgentConfig {
 
 const OUTPUT_LIMIT = 20_000;
 const DEFAULT_POLL_INTERVAL_MS = 250;
+const DEFAULT_CANCEL_GRACE_MS = 30_000;
 const TERMINAL_FAILURES = new Set(['failed', 'stopped', 'cancelled', 'canceled', 'error']);
+const CANCEL_TERMINAL_STATUSES = new Set(['cancelled', 'stopped', 'failed', 'interrupted', 'ready_for_review', 'published']);
 
 class NyxTimeoutError extends Error {}
+
+class NyxHttpError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
 
 const asErrorText = (value: unknown): string => {
   if (typeof value === 'string') return value;
@@ -58,6 +68,8 @@ export class NyxLauncher implements Launcher {
   private async run(cwd: string, onOutput: ((chunk: string) => void) | undefined, context: LaunchContext | undefined, prompt: string, tuning?: AgentTuning): Promise<RunResult> {
     let output = '';
     let streamedTranscript = '';
+    let taskUrl: string | undefined;
+    let lastStatus = 'unknown';
     const append = (chunk: string): void => {
       output = (output + chunk).slice(-OUTPUT_LIMIT);
       onOutput?.(chunk);
@@ -96,11 +108,13 @@ export class NyxLauncher implements Launcher {
       });
       const taskId = asErrorText(post.id).trim();
       if (!taskId) throw new Error('Nyx POST /coding/tasks returned no task id');
+      taskUrl = `${baseUrl}/coding/tasks/${encodeURIComponent(taskId)}`;
 
       while (true) {
-        const status = await this.request(`${baseUrl}/coding/tasks/${encodeURIComponent(taskId)}`, deadline, { method: 'GET' });
+        const status = await this.request(taskUrl, deadline, { method: 'GET' });
         streamTranscript(status.transcript);
         const state = asErrorText(status.status).toLowerCase();
+        lastStatus = state || 'unknown';
         if (state === 'ready_for_review') {
           return {
             ok: true, timedOut: false, exitCode: 0, outputTail: output,
@@ -124,9 +138,14 @@ export class NyxLauncher implements Launcher {
       if (error instanceof NyxTimeoutError || (error instanceof Error && error.name === 'AbortError')) {
         const message = `[nyx] ${error.message || 'task timed out'}`;
         append(`\n${message}\n`);
+        const uncertain = taskUrl
+          ? await this.cancelAfterTimeout(taskUrl, lastStatus, append, streamTranscript)
+          : undefined;
+        if (uncertain) append(`\n${uncertain}\n`);
         return {
           ok: false, timedOut: true, exitCode: null, outputTail: output,
           inputTokens: 0, outputTokens: 0, costEstimate: 0,
+          ...(uncertain ? { uncertain } : {}),
         };
       }
       const message = `[nyx] ${error instanceof Error ? error.message : String(error)}`;
@@ -136,6 +155,48 @@ export class NyxLauncher implements Launcher {
         inputTokens: 0, outputTokens: 0, costEstimate: 0,
       };
     }
+  }
+
+  private async cancelAfterTimeout(
+    taskUrl: string,
+    lastStatus: string,
+    append: (chunk: string) => void,
+    streamTranscript: (value: unknown) => void,
+  ): Promise<string | undefined> {
+    const cancelGraceMs = Math.max(1, this.opts.cancelGraceMs ?? DEFAULT_CANCEL_GRACE_MS);
+    const deadline = Date.now() + cancelGraceMs;
+    try {
+      await this.request(`${taskUrl}/cancel`, deadline, {
+        method: 'POST',
+        body: JSON.stringify({ reason: `Switchboard run timed out after ${this.opts.timeoutMs} ms` }),
+      }, [200, 202]);
+    } catch (error) {
+      if (error instanceof NyxHttpError && (error.status === 404 || error.status === 405)) {
+        return 'Nyx has no cancel endpoint (older build); the job may still be running';
+      }
+      return `cancel request failed: ${error instanceof Error ? error.message : String(error)}; the job may still be running`;
+    }
+
+    try {
+      while (Date.now() < deadline) {
+        const status = await this.request(taskUrl, deadline, { method: 'GET' });
+        streamTranscript(status.transcript);
+        lastStatus = asErrorText(status.status).toLowerCase() || 'unknown';
+        if (Date.now() >= deadline) break;
+        if (CANCEL_TERMINAL_STATUSES.has(lastStatus)) {
+          append(`\n[nyx] cancelled after timeout; terminal status: ${lastStatus}\n`);
+          return undefined;
+        }
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        await new Promise<void>(resolve => setTimeout(resolve, Math.min(this.pollIntervalMs(), remaining)));
+      }
+    } catch (error) {
+      if (!(error instanceof NyxTimeoutError)) {
+        return `cancel confirmation failed: ${error instanceof Error ? error.message : String(error)}; the job may still be running`;
+      }
+    }
+    return `Nyx accepted the cancel but reported no terminal status within ${cancelGraceMs} ms (last: ${lastStatus}); the job may still be running`;
   }
 
   private baseUrl(): string {
@@ -148,7 +209,7 @@ export class NyxLauncher implements Launcher {
     return Math.max(1, this.opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS);
   }
 
-  private async request(url: string, deadline: number, init: RequestInit): Promise<Record<string, unknown>> {
+  private async request(url: string, deadline: number, init: RequestInit, acceptedStatuses?: readonly number[]): Promise<Record<string, unknown>> {
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw new NyxTimeoutError('Nyx task polling timed out');
     const controller = new AbortController();
@@ -165,9 +226,9 @@ export class NyxLauncher implements Launcher {
       if (text) {
         try { body = JSON.parse(text); } catch { body = { detail: text }; }
       }
-      if (!response.ok) {
+      if (!response.ok || (acceptedStatuses && !acceptedStatuses.includes(response.status))) {
         const detail = body && typeof body === 'object' ? asErrorText((body as Record<string, unknown>).detail) : '';
-        throw new Error(`${init.method ?? 'GET'} ${new URL(url).pathname} returned HTTP ${response.status}${detail ? `: ${detail.slice(0, 1000)}` : ''}`);
+        throw new NyxHttpError(response.status, `${init.method ?? 'GET'} ${new URL(url).pathname} returned HTTP ${response.status}${detail ? `: ${detail.slice(0, 1000)}` : ''}`);
       }
       if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('Nyx returned a non-object JSON response');
       return body as Record<string, unknown>;

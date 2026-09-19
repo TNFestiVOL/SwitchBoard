@@ -12,6 +12,7 @@ export interface LaunchContext {
 export interface RunResult {
   ok: boolean;
   timedOut: boolean;
+  uncertain?: string;
   exitCode: number | null;
   outputTail: string;
   inputTokens: number;
