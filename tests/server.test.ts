@@ -9,6 +9,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { Store } from '../src/store.js';
 import { EventBus } from '../src/events.js';
 import { Dispatcher } from '../src/dispatcher.js';
+import { RemoteCoordinator } from '../src/remote.js';
 import { attachListenerFailure, createApp, isLoopbackAddress, mcpLoopbackGuard } from '../src/server.js';
 import type { Launcher, RunResult } from '../src/launcher.js';
 
@@ -184,6 +185,29 @@ describe('operator sessions', () => {
     for (const path of ['/health/live', '/health/ready', '/logo.png']) {
       expect((await request(app).get(path).set(forwarded)).status).toBe(200);
     }
+  });
+
+  it('requires an operator session to reconcile over LAN', async () => {
+    const run = store.createRun(1, 'claude', '');
+    store.setRunUncertain(run.id, 'process state unknown');
+    const changes = vi.fn();
+    bus.onChange(changes);
+    const res = await request(fromSocket('192.0.2.20')).post(`/api/runs/${run.id}/reconcile`).send({});
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual({ error: 'sign in required' });
+    expect(store.getRun(run.id)!.reconciled_at).toBeNull();
+    expect(store.listComments(1)).toEqual([]);
+    expect(changes).not.toHaveBeenCalled();
+  });
+
+  it('allows an authenticated operator to reconcile over LAN', async () => {
+    const run = store.createRun(1, 'claude', '');
+    store.setRunUncertain(run.id, 'process state unknown');
+    const cookie = sessionCookie(await login());
+    const res = await request(fromSocket('192.0.2.20')).post(`/api/runs/${run.id}/reconcile`)
+      .set('Cookie', cookie).send({});
+    expect(res.status).toBe(200);
+    expect(store.getRun(run.id)!.reconciled_by).toBe('human');
   });
 
   it('renders an escaped login form using the board layout without private data', async () => {
@@ -831,7 +855,7 @@ describe('server', () => {
     const res = await request(app).post('/api/drain');
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ draining: true, paused: true, activeRuns: 1 });
+    expect(res.body).toEqual({ draining: true, paused: true, activeRuns: 1, uncertainRuns: 0 });
     expect(store.getSetting('paused', '')).toBe('1');
     expect(store.getSetting('draining', '')).toBe('1');
     expect(changes).toHaveBeenCalledTimes(1);
@@ -892,7 +916,7 @@ describe('server', () => {
 
     expect(dispatcher.activeRuns()).toEqual([]);
     expect(store.getTask(task.id)!.status).toBe('ready');
-    expect(res.body).toEqual({ draining: true, paused: true, activeRuns: 0 });
+    expect(res.body).toEqual({ draining: true, paused: true, activeRuns: 0, uncertainRuns: 0 });
   });
 
   it('reports state with budgets and active runs', async () => {
@@ -904,6 +928,46 @@ describe('server', () => {
     expect(res.body.tasks).toHaveLength(1);
     expect(res.body.budgets.claude.level).toBe('ok');
     expect(res.body.activeRuns).toHaveLength(1);
+  });
+
+  it('reports worker contact and success in state only for machines with recorded contact', async () => {
+    const machines = [
+      { workerId: null, name: 'Infinity', ip: '', configured: true },
+      { workerId: 'seen', name: 'Seen PC', ip: '192.0.2.21', configured: true },
+      { workerId: 'unseen', name: 'Unseen PC', ip: '192.0.2.22', configured: true },
+    ];
+    const contactAt = 1_800_000_000_000;
+    const token = 'x'.repeat(32);
+    const remote = new RemoteCoordinator(store, bus, dispatcher, {
+      tokens: { seen: token }, bounceCap: 6, now: () => contactAt,
+    });
+    const claim = await request(remote.app).post('/workers/seen/claim')
+      .set('Authorization', `Bearer ${token}`).send({ agents: ['claude'], projects: ['staging'] });
+    expect(claim.status).toBe(200);
+    store.touchWorker('Infinity', 'claim', contactAt);
+    const fleetApp = createApp({ store, bus, dispatcher, machines });
+
+    const state = await request(fleetApp).get('/api/state');
+    expect(state.status).toBe(200);
+    expect(state.body.machines).toEqual([
+      machines[0], { ...machines[1], lastContactAt: contactAt, lastContactKind: 'claim' }, machines[2],
+    ]);
+    store.markWorkerSuccess('seen', contactAt + 1000);
+    expect((await request(fleetApp).get('/api/state')).body.machines[1].lastSuccessAt).toBe(contactAt + 1000);
+    expect(machines[1]).not.toHaveProperty('lastContactAt');
+  });
+
+  it('lists uncertain runs with task titles in state and drops reconciled runs', async () => {
+    const task = store.createTask({ project_id: 1, title: 'Lost job', description: '', assignee: 'claude', created_by: 'human', status: 'needs_human' });
+    const run = store.createRun(task.id, 'claude', '');
+    store.finishRun(run.id, { status: 'failed' });
+    expect((await request(app).get('/api/state')).body.uncertainRuns).toEqual([]);
+    store.setRunUncertain(run.id, 'lease expired');
+    expect((await request(app).get('/api/state')).body.uncertainRuns).toEqual([
+      { runId: run.id, taskId: task.id, taskTitle: task.title, agent: run.agent, reason: 'lease expired' },
+    ]);
+    store.reconcileRun(run.id, 'human', new Date().toISOString());
+    expect((await request(app).get('/api/state')).body.uncertainRuns).toEqual([]);
   });
 
   it('rejects shutdown from a LAN socket even with loopback forwarding headers', async () => {
@@ -923,6 +987,96 @@ describe('server', () => {
 
     expect(res.status).toBe(403);
     expect(shutdown).not.toHaveBeenCalled();
+  });
+
+  describe('run reconciliation', () => {
+    const uncertainRun = () => {
+      const task = store.createTask({ project_id: 1, title: 'Uncertain job', description: '', assignee: 'claude', created_by: 'human', status: 'needs_human' });
+      const run = store.createRun(task.id, 'claude', '');
+      store.finishRun(run.id, { status: 'failed' });
+      store.setRunUncertain(run.id, 'process state unknown');
+      return store.getRun(run.id)!;
+    };
+
+    it('records human reconciliation with one comment and event without changing run or task status', async () => {
+      const run = uncertainRun();
+      const task = store.getTask(run.task_id);
+      const changes = vi.fn();
+      bus.onChange(changes);
+      const before = Date.now();
+      const res = await request(app).post(`/api/runs/${run.id}/reconcile`).send({ note: 'Checked the worker.' });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ reconciled: true, runId: run.id });
+      const reconciled = store.getRun(run.id)!;
+      expect(reconciled).toEqual({ ...run, reconciled_by: 'human', reconciled_at: expect.any(String) });
+      expect(Date.parse(reconciled.reconciled_at!)).toBeGreaterThanOrEqual(before);
+      expect(Date.parse(reconciled.reconciled_at!)).toBeLessThanOrEqual(Date.now());
+      expect(store.getTask(run.task_id)).toEqual(task);
+      expect(store.listComments(run.task_id)).toEqual([expect.objectContaining({
+        author: 'human',
+        body: `Run ${run.id} marked reconciled by the operator. Note: Checked the worker. The process state was confirmed by a person; the work itself is still to be reviewed.`,
+      })]);
+      expect(changes).toHaveBeenCalledTimes(1);
+      expect(changes).toHaveBeenCalledWith({ kind: 'run_reconciled', taskId: run.task_id });
+    });
+
+    it('accepts reconciliation without a JSON body or note', async () => {
+      const run = uncertainRun();
+      const res = await request(app).post(`/api/runs/${run.id}/reconcile`);
+      expect(res.status).toBe(200);
+      expect(store.listComments(run.task_id)[0].body).toBe(`Run ${run.id} marked reconciled by the operator. The process state was confirmed by a person; the work itself is still to be reviewed.`);
+    });
+
+    it('rejects repeat reconciliation without another comment or event', async () => {
+      const run = uncertainRun();
+      await request(app).post(`/api/runs/${run.id}/reconcile`).send({});
+      const before = store.getRun(run.id);
+      const changes = vi.fn();
+      bus.onChange(changes);
+      const res = await request(app).post(`/api/runs/${run.id}/reconcile`).send({ note: 'Again' });
+      expect(res.status).toBe(409);
+      expect(res.body).toEqual({ error: expect.any(String) });
+      expect(store.getRun(run.id)).toEqual(before);
+      expect(store.listComments(run.task_id)).toHaveLength(1);
+      expect(changes).not.toHaveBeenCalled();
+    });
+
+    it('rejects reconciliation of a run that is not uncertain', async () => {
+      const run = uncertainRun();
+      const certain = store.createRun(run.task_id, 'claude', '');
+      const res = await request(app).post(`/api/runs/${certain.id}/reconcile`).send({});
+      expect(res.status).toBe(409);
+      expect(res.body).toEqual({ error: expect.any(String) });
+      expect(store.getRun(certain.id)).toEqual(certain);
+      expect(store.listComments(run.task_id)).toEqual([]);
+    });
+
+    it('returns 404 when reconciling an unknown run', async () => {
+      const res = await request(app).post('/api/runs/999/reconcile').send({});
+      expect(res.status).toBe(404);
+      expect(res.body).toEqual({ error: expect.any(String) });
+    });
+
+    it.each([
+      ['overlong', 'x'.repeat(2001)], ['numeric', 42], ['null', null],
+    ])('rejects an invalid reconciliation note (%s) without side effects', async (_label, note) => {
+      const run = uncertainRun();
+      const changes = vi.fn();
+      bus.onChange(changes);
+      const res = await request(app).post(`/api/runs/${run.id}/reconcile`).send({ note });
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ error: expect.any(String) });
+      expect(store.getRun(run.id)).toEqual(run);
+      expect(store.listComments(run.task_id)).toEqual([]);
+      expect(changes).not.toHaveBeenCalled();
+    });
+
+    it('accepts a reconciliation note at the 2000 character limit', async () => {
+      const run = uncertainRun();
+      const note = 'x'.repeat(2000);
+      expect((await request(app).post(`/api/runs/${run.id}/reconcile`).send({ note })).status).toBe(200);
+      expect(store.listComments(run.task_id)[0].body).toContain(` Note: ${note} The process state`);
+    });
   });
 
   it('refuses shutdown when paused without a drain latch', async () => {
@@ -950,6 +1104,46 @@ describe('server', () => {
     expect(res.body).toEqual({ error: expect.any(String), draining: true, activeRuns: 1 });
     expect(dispatcher.activeRuns()).toHaveLength(1);
     expect(shutdown).not.toHaveBeenCalled();
+  });
+
+  it('reports the unreconciled run count when draining', async () => {
+    const task = store.createTask({ project_id: 1, title: 'Lost job', description: '', assignee: 'claude', created_by: 'human', status: 'needs_human' });
+    const run = store.createRun(task.id, 'claude', '');
+    store.finishRun(run.id, { status: 'failed' });
+    store.setRunUncertain(run.id, 'lease expired');
+    const res = await request(app).post('/api/drain');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ draining: true, paused: true, activeRuns: 0, uncertainRuns: 1 });
+    await request(app).post(`/api/runs/${run.id}/reconcile`).send({});
+    expect((await request(app).post('/api/drain')).body.uncertainRuns).toBe(0);
+  });
+
+  it.each([1, 2])('refuses idle drained shutdown until all %i uncertain runs are reconciled', async count => {
+    const task = store.createTask({ project_id: 1, title: 'Lost job', description: '', assignee: 'claude', created_by: 'human', status: 'needs_human' });
+    const runs = Array.from({ length: count }, () => {
+      const run = store.createRun(task.id, 'claude', '');
+      store.finishRun(run.id, { status: 'failed' });
+      store.setRunUncertain(run.id, 'lease expired');
+      return { runId: run.id, taskId: task.id, taskTitle: task.title, agent: run.agent, reason: 'lease expired' };
+    });
+    await request(app).post('/api/drain');
+    const shutdown = vi.fn(async () => {});
+    const shutdownApp = createApp({ store, bus, dispatcher, shutdown });
+    for (let i = 0; i < runs.length; i++) {
+      const res = await request(shutdownApp).post('/api/shutdown');
+      expect(res.status).toBe(409);
+      expect(res.body).toEqual({
+        error: `${count - i} uncertain run(s) must be reconciled before shutdown`, uncertainRuns: runs.slice(i),
+      });
+      expect(dispatcher.activeRuns()).toEqual([]);
+      expect(shutdown).not.toHaveBeenCalled();
+      expect((await request(app).post(`/api/runs/${runs[i].runId}/reconcile`).send({})).status).toBe(200);
+    }
+    const accepted = await request(shutdownApp).post('/api/shutdown');
+    expect(accepted.status).toBe(202);
+    expect(accepted.body).toEqual({ stopping: true });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(shutdown).toHaveBeenCalledTimes(1);
   });
 
   it('accepts idle drained shutdown and invokes it once after the response finishes', async () => {

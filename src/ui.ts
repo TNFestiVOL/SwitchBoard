@@ -1,4 +1,5 @@
-import type { Agent, Author, Comment, Project, Run, Task, TaskStatus } from './types.js';
+import type { Agent, Author, Comment, Project, Task, TaskStatus } from './types.js';
+import type { StoredRun } from './store.js';
 import { AGENTS, TASK_STATUSES } from './types.js';
 import type { BudgetLevel } from './budget.js';
 import type { PlanUsage } from './plan-usage.js';
@@ -6,7 +7,10 @@ import type { PlanUsage } from './plan-usage.js';
 export interface BudgetView { used: number; soft: number; hard: number; level: BudgetLevel; }
 export interface PlanView { usage: PlanUsage | null; maxPercent: number; blocked: boolean; }
 export interface AgentInfo { model?: string; effort?: string; }
-export interface MachineChoice { workerId: string | null; name: string; ip: string; configured: boolean; }
+export interface MachineChoice {
+  workerId: string | null; name: string; ip: string; configured: boolean;
+  lastContactAt?: number; lastContactKind?: string; lastSuccessAt?: number;
+}
 export interface BoardData {
   authenticated?: boolean;
   machines?: MachineChoice[];
@@ -21,12 +25,13 @@ export interface BoardData {
   paused: boolean;
   draining: boolean;
   activeRuns: { runId: number; taskId: number; agent: Agent }[];
+  uncertainRuns: { runId: number; taskId: number; taskTitle: string; agent: Agent; reason: string }[];
 }
 export interface TaskData {
   task: Task;
   project: Project;
   comments: Comment[];
-  runs: Run[];
+  runs: StoredRun[];
   activeRunId?: number;
 }
 
@@ -203,9 +208,9 @@ async function refreshPage() {
       });
     }
     if (swapped) updateAttention(true);
-    // Refresh project choices without replacing form controls or disturbing drafts/focus.
-    for (const select of document.querySelectorAll('select[name="project"]')) {
-      const incoming = next.querySelector('select[name="project"]');
+    // Refresh choices without replacing form controls or disturbing drafts/focus.
+    for (const select of document.querySelectorAll('select[name="project"], select[name="worker_id"]')) {
+      const incoming = next.querySelector('select[name="' + select.name + '"]');
       if (!incoming || select.innerHTML === incoming.innerHTML) continue;
       const value = select.value;
       select.innerHTML = incoming.innerHTML;
@@ -219,6 +224,15 @@ async function refreshPage() {
       const untouched = select.value === select.dataset.rendered;
       select.dataset.rendered = incoming.dataset.rendered;
       if (untouched) select.value = incoming.dataset.rendered;
+    }
+    // Keep each pending reconciliation form intact while its run still needs an operator.
+    const reconciliation = document.getElementById('run-reconciliation');
+    const incomingReconciliation = reconciliation && next.querySelector('#run-reconciliation');
+    if (incomingReconciliation) {
+      const current = new Map([...reconciliation.children].map(form => [form.id, form]));
+      const incoming = new Map([...incomingReconciliation.children].map(form => [form.id, form]));
+      for (const [id, form] of current) if (!incoming.has(id)) form.remove();
+      for (const [id, form] of incoming) if (!current.has(id)) reconciliation.append(form);
     }
     restoreFolds();
     window.scrollTo(x, y);
@@ -335,6 +349,7 @@ function header(data: BoardData): string {
     <a class="brand" href="/" aria-label="Switchboard home"><img src="/logo.png" alt="Switchboard"></a>
     <h1><a href="/">SWITCHBOARD</a></h1>
     ${attention.length ? `<span class="badge attn" title="${esc(attention.map(t => `#${t.id} ${t.title} (${t.status})`).join('\n'))}">${attention.length} need you</span>` : ''}
+    ${data.uncertainRuns.length ? `<span class="badge attn" title="${esc(data.uncertainRuns.map(r => `#${r.taskId} run ${r.runId}: ${r.reason}`).join('\n'))}">${data.uncertainRuns.length} uncertain</span>` : ''}
     <script type="application/json" id="attention">${JSON.stringify(attention).replace(/</g, '\\u003c')}</script>
     <button id="enable-alerts" type="button" onclick="enableAlerts()" hidden>Enable alerts</button>
     ${data.draining ? '<button disabled>Draining…</button>' : data.paused
@@ -346,7 +361,16 @@ function header(data: BoardData): string {
     }).join(' ') : 'idle'}</span>
     <div class="meters">${AGENTS.map(a => meter(a, data.budgets[a], data.plan[a], data.agents[a])).join('')}</div>
     ${data.authenticated ? '<form method="post" action="/logout"><button type="submit">Sign out</button></form>' : ''}
-  </header>${data.draining ? '<div class="banner">Dispatch is draining — the host stops when running jobs finish.</div>' : data.paused ? '<div class="banner">Dispatch is paused — agents will not be launched.</div>' : ''}</div>`;
+  </header>${data.draining ? `<div class="banner">Dispatch is draining — the host stops when running jobs finish.${data.uncertainRuns.length ? ` ${data.uncertainRuns.length} uncertain run(s) need reconciliation before the host can stop.` : ''}</div>` : data.paused ? '<div class="banner">Dispatch is paused — agents will not be launched.</div>' : ''}</div>`;
+}
+
+function relativeContact(at: number): string {
+  const seconds = Math.max(0, Math.floor((Date.now() - at) / 1000));
+  const [count, unit] = seconds < 60 ? [seconds, 'second']
+    : seconds < 3600 ? [Math.floor(seconds / 60), 'minute']
+    : seconds < 86400 ? [Math.floor(seconds / 3600), 'hour']
+    : [Math.floor(seconds / 86400), 'day'];
+  return `${count} ${unit}${count === 1 ? '' : 's'} ago`;
 }
 
 function brainBadge(t: Task): string {
@@ -512,7 +536,10 @@ export function renderBoard(data: BoardData): string {
 
   const assigneeOptions = ASSIGNEE_OPTIONS;
   const machineOptions = (data.machines ?? [{ workerId: null, name: 'This PC', ip: '', configured: true }])
-    .map(pc => `<option value="${esc(pc.workerId ?? '')}"${pc.configured ? '' : ' disabled'}>${esc(pc.name)}${pc.ip ? ` — ${esc(pc.ip)}` : ''}${pc.workerId === null ? ' (local)' : pc.configured ? ' (registered)' : ' (setup needed)'}</option>`).join('');
+    .map(pc => {
+      const contact = pc.lastContactAt === undefined ? 'never seen' : `last contact ${relativeContact(pc.lastContactAt)} via ${esc(pc.lastContactKind)}`;
+      return `<option value="${esc(pc.workerId ?? '')}"${pc.configured ? '' : ' disabled'}>${esc(pc.name)}${pc.ip ? ` — ${esc(pc.ip)}` : ''}${pc.workerId === null ? ' (local)' : pc.configured ? ` (registered · ${contact})` : ' (setup needed)'}</option>`;
+    }).join('');
 
   const forms = `
   ${plannerPanel}
@@ -548,7 +575,14 @@ export function renderTask(data: TaskData, board: BoardData): string {
   const runRows = runs.map(r => `<tr>
     <td>#${r.id}</td><td>${esc(r.agent)}</td><td>${esc(r.status)}</td>
     <td>${r.input_tokens + r.output_tokens} tok</td><td>$${r.cost_estimate.toFixed(4)}</td>
-    <td>${esc(r.started_at)}</td></tr>`).join('');
+    <td>${esc(r.started_at)}</td>
+    <td>${r.reconciled_at !== null ? `reconciled by ${esc(r.reconciled_by)} at ${esc(r.reconciled_at)}` : r.uncertain !== null ? `uncertain: ${esc(r.uncertain)}` : ''}</td></tr>`).join('');
+
+  const reconcileForms = runs.filter(r => r.uncertain !== null && r.reconciled_at === null).map(r => `
+    <form id="reconcile-${r.id}" class="inline" style="margin-top:.5rem" onsubmit="return submitForm(event, '/api/runs/${r.id}/reconcile')">
+      <label>Run #${r.id} note <input type="text" name="note" maxlength="2000" placeholder="Optional note"></label>
+      <button type="submit">Mark reconciled</button>
+    </form>`).join('');
 
   const statusOptions = TASK_STATUSES.map(s =>
     `<option value="${s}" ${s === task.status ? 'selected' : ''}>${s}</option>`).join('');
@@ -584,8 +618,10 @@ export function renderTask(data: TaskData, board: BoardData): string {
       <button type="submit" style="margin-top:.4rem">Post</button>
     </form>
   </div>
-  <div class="panel" data-live="runs">${live}<h2>Runs</h2>
-    ${runs.length ? `<table class="runs"><tr><th>run</th><th>agent</th><th>status</th><th>tokens</th><th>cost</th><th>started</th></tr>${runRows}</table>` : '<p class="muted">No runs yet.</p>'}
+  <div class="panel"><div data-live="runs">${live}<h2>Runs</h2>
+    ${runs.length ? `<table class="runs"><tr><th>run</th><th>agent</th><th>status</th><th>tokens</th><th>cost</th><th>started</th><th>outcome</th></tr>${runRows}</table>` : '<p class="muted">No runs yet.</p>'}
+    </div>
+    <div id="run-reconciliation">${reconcileForms}</div>
   </div>`;
 
   return layout(`#${task.id} ${task.title} — Switchboard`, body);

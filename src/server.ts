@@ -190,21 +190,34 @@ export function createApp({ store, bus, dispatcher, shutdown, readiness, info, a
     return map;
   };
 
-  const boardData = (authenticated = false): BoardData => ({
-    ...(operatorPassword ? { authenticated } : {}),
-    machines,
-    tasks: store.listTasks(),
-    deps: depsFor(store.listTasks()),
-    planningActive: planningActive(),
-    projects: store.listProjects(),
-    budgets: Object.fromEntries(AGENTS.map(a => [a, dispatcher.budgetFor(a)])) as BoardData['budgets'],
-    plan: Object.fromEntries(AGENTS.map(a => [a, dispatcher.planFor(a)])) as BoardData['plan'],
-    agents: tuning,
-    modelChoices: models,
-    paused: store.getSetting('paused', '0') === '1',
-    draining: store.getSetting('draining', '0') === '1',
-    activeRuns: dispatcher.activeRuns(),
-  });
+  const uncertainRuns = (): BoardData['uncertainRuns'] => store.listUncertainRuns().map(run => ({
+    runId: run.id, taskId: run.task_id, taskTitle: store.getTask(run.task_id)!.title,
+    agent: run.agent, reason: run.uncertain!,
+  }));
+
+  const boardData = (authenticated = false): BoardData => {
+    const contacts = new Map(store.listWorkers().map(worker => [worker.worker_id, worker]));
+    return {
+      ...(operatorPassword ? { authenticated } : {}),
+      machines: machines?.map(machine => {
+        const contact = machine.workerId === null ? undefined : contacts.get(machine.workerId);
+        return contact ? { ...machine, lastContactAt: contact.last_contact_at, lastContactKind: contact.last_contact_kind,
+          ...(contact.last_success_at === null ? {} : { lastSuccessAt: contact.last_success_at }) } : machine;
+      }),
+      tasks: store.listTasks(),
+      deps: depsFor(store.listTasks()),
+      planningActive: planningActive(),
+      projects: store.listProjects(),
+      budgets: Object.fromEntries(AGENTS.map(a => [a, dispatcher.budgetFor(a)])) as BoardData['budgets'],
+      plan: Object.fromEntries(AGENTS.map(a => [a, dispatcher.planFor(a)])) as BoardData['plan'],
+      agents: tuning,
+      modelChoices: models,
+      paused: store.getSetting('paused', '0') === '1',
+      draining: store.getSetting('draining', '0') === '1',
+      activeRuns: dispatcher.activeRuns(),
+      uncertainRuns: uncertainRuns(),
+    };
+  };
 
   // SSE first — it must not go through the JSON body parser.
   app.get('/events', (req, res) => {
@@ -359,6 +372,31 @@ export function createApp({ store, bus, dispatcher, shutdown, readiness, info, a
     guard(res, () => human.update_status({ id: Number(req.params.id), status, client_id, expected_status }));
   });
 
+  app.post('/api/runs/:id/reconcile', (req, res) => {
+    const id = Number(req.params.id);
+    const run = store.getRun(id);
+    if (!run) {
+      res.status(404).json({ error: `no run ${id}` });
+      return;
+    }
+    guard(res, () => {
+      if (run.uncertain === null || run.reconciled_at !== null) {
+        throw new ConflictError(`run ${id} is not uncertain or is already reconciled`);
+      }
+      const note: unknown = req.body?.note;
+      if (note !== undefined && (typeof note !== 'string' || note.length > 2000)) {
+        throw new ToolError('note must be a string of at most 2000 characters');
+      }
+      store.transaction(() => {
+        store.reconcileRun(id, 'human', new Date().toISOString());
+        store.addComment(run.task_id, 'human',
+          `Run ${id} marked reconciled by the operator.${note ? ` Note: ${note}` : ''} The process state was confirmed by a person; the work itself is still to be reviewed.`);
+      });
+      bus.change({ kind: 'run_reconciled', taskId: run.task_id });
+      return { reconciled: true, runId: id };
+    });
+  });
+
   app.post('/api/tuning', (req, res) => {
     const { agent, model, effort } = req.body as { agent?: string; model?: string; effort?: string };
     if (!(AGENTS as string[]).includes(agent ?? '')) {
@@ -407,7 +445,7 @@ export function createApp({ store, bus, dispatcher, shutdown, readiness, info, a
     store.setSetting('paused', '1');
     store.setSetting('draining', '1');
     bus.change({ kind: 'draining' });
-    res.json({ draining: true, paused: true, activeRuns: dispatcher.activeRuns().length });
+    res.json({ draining: true, paused: true, activeRuns: dispatcher.activeRuns().length, uncertainRuns: store.listUncertainRuns().length });
   });
 
   app.post('/api/drain/clear', (_req, res) => {
@@ -419,6 +457,11 @@ export function createApp({ store, bus, dispatcher, shutdown, readiness, info, a
   app.post('/api/shutdown', (req, res) => {
     if (!isLoopbackAddress(req.socket.remoteAddress)) {
       res.status(403).json({ error: 'host shutdown is accepted from this machine only' });
+      return;
+    }
+    const unreconciled = uncertainRuns();
+    if (unreconciled.length) {
+      res.status(409).json({ error: `${unreconciled.length} uncertain run(s) must be reconciled before shutdown`, uncertainRuns: unreconciled });
       return;
     }
     const draining = store.getSetting('draining', '0') === '1';

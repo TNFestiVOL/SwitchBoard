@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { runInNewContext } from 'node:vm';
 import { COLLAPSE_AFTER, renderBoard, renderTask, type BoardData, type TaskData } from '../src/ui.js';
 import type { Task } from '../src/types.js';
+import type { StoredRun } from '../src/store.js';
 
 const budget = { used: 0, soft: 0, hard: 0, level: 'ok' as const };
 const plan = { usage: null, maxPercent: 0, blocked: false };
@@ -27,6 +28,7 @@ function board(tasks: Task[]): BoardData {
     paused: false,
     draining: false,
     activeRuns: [],
+    uncertainRuns: [],
   };
 }
 
@@ -477,6 +479,150 @@ describe('form request outcomes', () => {
     expect(page.form.dataset.clientId).toBe(pendingId);
     expect(page.draft.value).toBe('Original draft');
     expect(page.alert).toHaveBeenCalledWith('Could not reach Switchboard. Your draft is preserved.');
+  });
+});
+
+describe('worker contact labels', () => {
+  it.each([
+    [25_000, '25 seconds ago'], [60_000, '1 minute ago'], [120_000, '2 minutes ago'],
+    [7_200_000, '2 hours ago'], [259_200_000, '3 days ago'],
+  ])('renders a registered worker contact %i milliseconds ago as %s', (age, relative) => {
+    const now = 1_800_000_000_000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      const html = renderBoard({ ...board([]), machines: [
+        { workerId: 'remote', name: 'Remote PC', ip: '192.0.2.21', configured: true, lastContactAt: now - age, lastContactKind: 'claim' },
+      ] });
+      expect(html).toContain(`Remote PC — 192.0.2.21 (registered · last contact ${relative} via claim)</option>`);
+    } finally { clock.mockRestore(); }
+  });
+
+  it('refreshes machine contact labels without changing the selected worker', async () => {
+    const live = livePage();
+    let optionsHtml = 'never seen';
+    const select = {
+      name: 'worker_id', value: 'remote', options: [{ value: '' }, { value: 'remote' }],
+      get innerHTML() { return optionsHtml; },
+      set innerHTML(value: string) { optionsHtml = value; select.value = ''; },
+    };
+    const querySelectorAll = live.context.document.querySelectorAll;
+    Object.assign(live.context.document, { querySelectorAll: (selector: string) =>
+      selector.includes('select[name="worker_id"]') ? [select] : querySelectorAll(selector) });
+    Object.assign(live.context, { DOMParser: function () {
+      return { parseFromString: () => ({ querySelector: (selector: string) =>
+        selector === 'select[name="worker_id"]' ? { innerHTML: 'last contact 1 second ago via claim' } : null }) };
+    } });
+    await live.refresh();
+    expect(select.innerHTML).toBe('last contact 1 second ago via claim');
+    expect(select.value).toBe('remote');
+  });
+
+  it('labels unseen workers honestly while preserving local and setup labels', () => {
+    const html = renderBoard({ ...board([]), machines: [
+      { workerId: null, name: 'Infinity', ip: '', configured: true },
+      { workerId: 'unseen', name: 'Unseen PC', ip: '192.0.2.22', configured: true },
+      { workerId: 'setup', name: 'Setup PC', ip: '192.0.2.23', configured: false },
+    ] });
+    expect(html).toContain('<option value="">Infinity (local)</option>');
+    expect(html).toContain('<option value="unseen">Unseen PC — 192.0.2.22 (registered · never seen)</option>');
+    expect(html).toContain('<option value="setup" disabled>Setup PC — 192.0.2.23 (setup needed)</option>');
+  });
+});
+
+describe('uncertain runs UI', () => {
+  const uncertain = [
+    { runId: 7, taskId: 1, taskTitle: 'Card 1', agent: 'claude' as const, reason: 'lost <contact> & "unknown"' },
+    { runId: 8, taskId: 2, taskTitle: 'Card 2', agent: 'claude' as const, reason: 'orphaned' },
+  ];
+  const run: StoredRun = {
+    id: 7, task_id: 1, agent: 'claude', status: 'failed', prompt: '', output_tail: '',
+    input_tokens: 0, output_tokens: 0, cost_estimate: 0, started_at: '2026-09-19T00:00:00Z',
+    finished_at: '2026-09-19T00:01:00Z', uncertain: uncertain[0].reason, reconciled_at: null, reconciled_by: null,
+  };
+  const page = (runs: StoredRun[]) => renderTask({ task: task(1, 'needs_human'), project: board([]).projects[0], comments: [], runs }, board([]));
+
+  it('shows an uncertain badge with escaped run reasons in the live header', () => {
+    const html = renderBoard({ ...board([]), uncertainRuns: uncertain });
+    const header = html.match(/<div data-live="header">([\s\S]*?)<\/header>/)![1];
+    expect(header).toContain('title="#1 run 7: lost &lt;contact&gt; &amp; &quot;unknown&quot;\n#2 run 8: orphaned">2 uncertain</span>');
+  });
+
+  it('omits the uncertain badge and reconciliation warning when no runs are uncertain', () => {
+    const html = renderBoard({ ...board([]), draining: true });
+    expect(html).not.toContain(' uncertain</span>');
+    expect(html).not.toContain('need reconciliation before the host can stop');
+  });
+
+  it('adds the unreconciled count to the draining banner only while draining', () => {
+    const data = { ...board([]), uncertainRuns: uncertain };
+    const warning = ' 2 uncertain run(s) need reconciliation before the host can stop.';
+    expect(renderBoard({ ...data, draining: true })).toContain(`finish.${warning}</div>`);
+    expect(renderBoard(data)).not.toContain(warning);
+  });
+
+  it('shows uncertain outcomes and note forms only for unreconciled uncertain runs', () => {
+    const html = page([run, { ...run, id: 8, uncertain: null }]);
+    expect(html).toContain('<th>outcome</th>');
+    expect(html).toContain('uncertain: lost &lt;contact&gt; &amp; &quot;unknown&quot;');
+    const forms = [...html.matchAll(/<form\b[^>]*onsubmit="return submitForm\(event, '\/api\/runs\/(\d+)\/reconcile'\)"[^>]*>([\s\S]*?)<\/form>/g)];
+    expect(forms.map(match => match[1])).toEqual(['7']);
+    expect(forms[0][2]).toMatch(/<input[^>]*type="text"[^>]*name="note"[^>]*maxlength="2000"/);
+    expect(forms[0][2]).toContain('Mark reconciled</button>');
+    expect(html).toMatch(/<td><\/td>\s*<\/tr>/);
+  });
+
+  it('shows who reconciled a run and when without a reconciliation form', () => {
+    const html = page([{ ...run, reconciled_by: 'worker:<remote>', reconciled_at: '2026-09-19T02:00:00Z' }]);
+    expect(html).toContain('reconciled by worker:&lt;remote&gt; at 2026-09-19T02:00:00Z');
+    expect(html).not.toContain('/api/runs/7/reconcile');
+    expect(html).not.toContain('uncertain: lost');
+  });
+
+  it('preserves reconciliation drafts during live updates and syncs newly uncertain or reconciled runs', async () => {
+    const live = livePage();
+    type Form = { id: string; note: { value: string }; remove: () => void };
+    const controls = { children: [] as Form[], append: (form: Form) => { controls.children.push(form); } };
+    const form = (id: number, draft = ''): Form => {
+      const entry: Form = { id: `reconcile-${id}`, note: { value: draft }, remove: () => {
+        controls.children = controls.children.filter(child => child !== entry);
+      } };
+      return entry;
+    };
+    const draft = form(7, 'Still checking the worker');
+    controls.children.push(draft);
+    let incoming = [form(7), form(8)];
+    const getElementById = live.context.document.getElementById;
+    Object.assign(live.context.document, { getElementById: (id: string) => id === 'run-reconciliation' ? controls : getElementById(id) });
+    Object.assign(live.context, { DOMParser: function () {
+      return { parseFromString: () => ({ querySelector: (selector: string) =>
+        selector === '#run-reconciliation' ? { children: incoming } : null }) };
+    } });
+    await live.refresh();
+    expect(controls.children.map(child => child.id)).toEqual(['reconcile-7', 'reconcile-8']);
+    expect(controls.children[0]).toBe(draft);
+    expect(draft.note.value).toBe('Still checking the worker');
+    incoming = [form(8)];
+    await live.refresh();
+    expect(controls.children.map(child => child.id)).toEqual(['reconcile-8']);
+    incoming = [form(8), form(9)];
+    await live.refresh();
+    expect(controls.children.map(child => child.id)).toEqual(['reconcile-8', 'reconcile-9']);
+  });
+
+  it('keeps reconciliation forms and note inputs outside all live regions', () => {
+    const html = page([run]).replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/g, '');
+    const ancestors: { tag: string; live: boolean }[] = [];
+    let found = false;
+    for (const match of html.matchAll(/<(\/?)([a-z][\w-]*)\b([^>]*)>/g)) {
+      const [, closing, tag, attrs] = match;
+      if (closing) { ancestors.pop(); continue; }
+      if ((tag === 'form' && attrs.includes('/api/runs/7/reconcile')) || (tag === 'input' && attrs.includes('name="note"'))) {
+        expect(ancestors.some(parent => parent.live)).toBe(false);
+        found = true;
+      }
+      if (!['input', 'img', 'meta', 'link', 'br', 'hr'].includes(tag)) ancestors.push({ tag, live: /\bdata-live=/.test(attrs) });
+    }
+    expect(found).toBe(true);
   });
 });
 
