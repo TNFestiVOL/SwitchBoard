@@ -8,7 +8,7 @@ import { CliLauncher } from './launcher.js';
 import { NyxLauncher } from './nyx-launcher.js';
 import { AgentLauncher } from './agent-launcher.js';
 import { Dispatcher } from './dispatcher.js';
-import { createApp } from './server.js';
+import { attachListenerFailure, createApp } from './server.js';
 import { scanClaudeTranscripts } from './claude-usage.js';
 import { PlanUsageTracker } from './plan-usage.js';
 import { WorktreeManager } from './worktrees.js';
@@ -94,7 +94,7 @@ const dispatcher = new Dispatcher(store, launcher, bus, {
 });
 
 void planTracker.refresh().then(() => bus.change({ kind: 'plan_refreshed' }));
-setInterval(() => {
+const planRefreshInterval = setInterval(() => {
   void planTracker.refresh().then(() => bus.change({ kind: 'plan_refreshed' }));
 }, config.planRefreshMs);
 
@@ -102,13 +102,15 @@ dispatcher.recoverOrphans({ remoteEnabled: !!config.remote });
 
 const workerTokens = config.remote ? resolveWorkerTokens(config.remote.tokenEnv) : { tokens: {}, problems: [] };
 for (const problem of workerTokens.problems) console.warn(`[remote] ${problem}`);
+let remoteExpireInterval: ReturnType<typeof setInterval> | undefined;
 const remoteServer = (() => {
   if (!config.remote) return;
   const remote = new RemoteCoordinator(store, bus, dispatcher, { tokens: workerTokens.tokens, bounceCap: config.bounceCap });
   remote.expire();
-  setInterval(() => remote.expire(), 5000);
+  remoteExpireInterval = setInterval(() => remote.expire(), 5000);
   return remote.app.listen(config.remote.port, config.remote.host ?? '0.0.0.0', () => console.log(`Worker listener on port ${config.remote!.port}`));
 })();
+if (remoteServer) attachListenerFailure(remoteServer, `worker port ${config.remote!.port}`);
 
 // Persist tuning changes from the UI back into switchboard.config.json,
 // preserving whatever else the user has in there.
@@ -120,6 +122,7 @@ const machines = (config.machines ?? [{ workerId: null, name: 'This PC', ip: '12
 }));
 const app = createApp({
   store, bus, dispatcher, agentInfo: config.tuning, modelChoices: config.modelChoices, machines,
+  shutdown,
   persistTuning: () => saveTuning(configPath, config.tuning),
   workers: new Set(Object.keys(workerTokens.tokens)),
   readiness: () => config.remote && !remoteServer?.listening
@@ -127,7 +130,7 @@ const app = createApp({
     : { ok: true },
   info: { version, bootId },
 });
-app.listen(config.port, '0.0.0.0', () => {
+const boardServer = app.listen(config.port, '0.0.0.0', () => {
   console.log(`
   Switchboard is up.
 
@@ -146,4 +149,26 @@ app.listen(config.port, '0.0.0.0', () => {
 `);
 });
 
-setInterval(() => dispatcher.tick(), config.sweepMs);
+attachListenerFailure(boardServer, `board port ${config.port}`);
+const dispatcherSweepInterval = setInterval(() => dispatcher.tick(), config.sweepMs);
+
+let stopping = false;
+async function shutdown(): Promise<void> {
+  if (stopping) return;
+  stopping = true;
+  clearInterval(dispatcherSweepInterval);
+  clearInterval(planRefreshInterval);
+  if (remoteExpireInterval) clearInterval(remoteExpireInterval);
+  await Promise.all([boardServer, remoteServer].map(server => {
+    if (!server) return;
+    return new Promise<void>(resolve => {
+      server.close(() => resolve());
+      server.closeAllConnections();
+    });
+  }));
+  store.close();
+  process.exit(0);
+}
+
+process.on('SIGINT', () => { void shutdown(); });
+process.on('SIGTERM', () => { void shutdown(); });

@@ -1,5 +1,6 @@
 import express from 'express';
 import { mkdirSync } from 'node:fs';
+import type { Server } from 'node:http';
 import { isIP } from 'node:net';
 import { join } from 'node:path';
 import type { Store } from './store.js';
@@ -19,6 +20,7 @@ export interface AppDeps {
   store: Store;
   bus: EventBus;
   dispatcher: Dispatcher;
+  shutdown?: () => Promise<void>;
   readiness?: () => { ok: true } | { ok: false; reason: string };
   info?: { version: string; bootId: string };
   /** Per-agent model/effort from config, shown in the UI header. Mutated in place by /api/tuning. */
@@ -30,6 +32,13 @@ export interface AppDeps {
 }
 
 const MCP_ACTORS = new Set<Author>([...AGENTS, 'human']);
+
+export function attachListenerFailure(server: Server, label: string, exit: (code: number) => void = process.exit): void {
+  server.on('error', (error: NodeJS.ErrnoException) => {
+    console.error(`[listener] ${label} failed: ${error.code ?? error.message}`);
+    exit(1);
+  });
+}
 
 export function isLoopbackAddress(addr: string | undefined): boolean {
   if (addr === '::1') return true;
@@ -45,7 +54,7 @@ export const mcpLoopbackGuard: express.RequestHandler = (req, res, next) => {
   next();
 };
 
-export function createApp({ store, bus, dispatcher, readiness, info, agentInfo, persistTuning, modelChoices, machines, workers }: AppDeps): express.Express {
+export function createApp({ store, bus, dispatcher, shutdown, readiness, info, agentInfo, persistTuning, modelChoices, machines, workers }: AppDeps): express.Express {
   const app = express();
   const human = toolHandlers(store, bus, 'human', { workers });
   // Preserve the caller's nested tuning objects (the UI mutates them in place),
@@ -81,6 +90,7 @@ export function createApp({ store, bus, dispatcher, readiness, info, agentInfo, 
     agents: tuning,
     modelChoices: models,
     paused: store.getSetting('paused', '0') === '1',
+    draining: store.getSetting('draining', '0') === '1',
     activeRuns: dispatcher.activeRuns(),
   });
 
@@ -272,9 +282,41 @@ export function createApp({ store, bus, dispatcher, readiness, info, agentInfo, 
   });
 
   app.post('/api/resume', (_req, res) => {
+    if (store.getSetting('draining', '0') === '1') {
+      res.status(409).json({ error: 'host is draining; clear the drain before resuming' });
+      return;
+    }
     store.setSetting('paused', '0');
     bus.change({ kind: 'resumed' });
     res.json({ paused: false });
+  });
+
+  app.post('/api/drain', (_req, res) => {
+    store.setSetting('paused', '1');
+    store.setSetting('draining', '1');
+    bus.change({ kind: 'draining' });
+    res.json({ draining: true, paused: true, activeRuns: dispatcher.activeRuns().length });
+  });
+
+  app.post('/api/drain/clear', (_req, res) => {
+    store.setSetting('draining', '0');
+    bus.change({ kind: 'drain_cleared' });
+    res.json({ draining: false });
+  });
+
+  app.post('/api/shutdown', (req, res) => {
+    if (!isLoopbackAddress(req.socket.remoteAddress)) {
+      res.status(403).json({ error: 'host shutdown is accepted from this machine only' });
+      return;
+    }
+    const draining = store.getSetting('draining', '0') === '1';
+    const activeRuns = dispatcher.activeRuns().length;
+    if (!draining || activeRuns > 0) {
+      res.status(409).json({ error: 'host must be draining with no active runs before shutdown', draining, activeRuns });
+      return;
+    }
+    res.once('finish', () => setImmediate(() => { void shutdown?.(); }));
+    res.status(202).json({ stopping: true });
   });
 
   app.get('/api/state', (_req, res) => {

@@ -25,9 +25,35 @@ function board(tasks: Task[]): BoardData {
     deps: {},
     planningActive: false,
     paused: false,
+    draining: false,
     activeRuns: [],
   };
 }
+
+describe('dispatch header', () => {
+  it('shows the draining banner and disables resume while draining', () => {
+    const html = renderBoard({ ...board([]), paused: true, draining: true });
+    expect(html).toContain('Dispatch is draining — the host stops when running jobs finish.');
+    expect(html).toContain('<button disabled>Draining…</button>');
+    expect(html).not.toContain('Resume dispatch');
+    expect(html).not.toContain('Dispatch is paused — agents will not be launched.');
+  });
+
+  it('keeps the paused banner and resume control when not draining', () => {
+    const html = renderBoard({ ...board([]), paused: true });
+    expect(html).toContain('Dispatch is paused — agents will not be launched.');
+    expect(html).toContain('Resume dispatch');
+    expect(html).not.toContain('Dispatch is draining');
+    expect(html).not.toContain('Draining…');
+  });
+
+  it('omits the draining banner and keeps pause available during normal dispatch', () => {
+    const html = renderBoard(board([]));
+    expect(html).toContain('Pause dispatch');
+    expect(html).not.toContain('Dispatch is draining');
+    expect(html).not.toContain('Draining…');
+  });
+});
 
 describe('board columns fold after the newest cards', () => {
   it('shows every card and no fold button when a column is short', () => {

@@ -1,4 +1,4 @@
-param([ValidateSet('Start','Stop')][string]$Action='Start',[switch]$NoBrowser,[ValidateRange(0,3600)][int]$WaitSeconds=30)
+param([ValidateSet('Start','Stop')][string]$Action='Start',[switch]$NoBrowser,[ValidateRange(0,3600)][int]$WaitSeconds=30,[switch]$Supervised)
 $ErrorActionPreference='Stop'
 $root=Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $root
@@ -50,9 +50,12 @@ try {
             }
             if(!$ready){throw 'Startup not ready. Check production logs before retrying.'}
             $server=Get-Server
-            $null=Invoke-RestMethod "$url/api/resume" -Method Post -TimeoutSec 5
+            if(!$Supervised){
+                $null=Invoke-RestMethod "$url/api/drain/clear" -Method Post -TimeoutSec 5
+                $null=Invoke-RestMethod "$url/api/resume" -Method Post -TimeoutSec 5
+            }
         }
-        $null=Get-State
+        $state=Get-State
         if($config.remote){
             $listeners=@(Get-NetTCPConnection -State Listen | Where-Object {$_.LocalPort -eq $config.remote.port -and $_.OwningProcess -eq $server.ProcessId})
             if(!$listeners.Count){throw 'Board is up but worker listener is not ready. Check production logs.'}
@@ -62,23 +65,31 @@ try {
                 Sort-Object Name -Descending | Select-Object -Skip 10 |
                 ForEach-Object {Remove-Item -LiteralPath $_.FullName}
         }
-        Write-Host "Stack ready: $url/ (board, MCP, dispatcher, configured worker listener)"
+        Write-Host "Stack ready: $url/ (board, MCP, dispatcher, configured worker listener; paused=$($state.paused), draining=$($state.draining))"
         if(!$NoBrowser){Start-Process "$url/"}
     }else{
         if(!$server){Write-Host 'Switchboard is already stopped.';return}
-        $null=Invoke-RestMethod "$url/api/pause" -Method Post -TimeoutSec 5
+        $null=Invoke-RestMethod "$url/api/drain" -Method Post -TimeoutSec 5
         $deadline=(Get-Date).AddSeconds($WaitSeconds)
         do {
             $state=Get-State
             if(@($state.activeRuns).Count -eq 0){break}
-            if((Get-Date) -ge $deadline){throw 'Jobs still active. Dispatch remains paused; run END again when they finish. No process was killed.'}
+            if((Get-Date) -ge $deadline){throw 'Jobs still active. Host stays draining; run END again when they finish. No process was killed.'}
             Write-Host 'Waiting for active jobs...'
             Start-Sleep -Seconds 2
         }while($true)
         $current=Get-Server
         if(!$current -or $current.ProcessId -ne $server.ProcessId -or $current.CreationDate -ne $server.CreationDate){throw 'Server identity changed; refusing to stop.'}
-        Stop-Process -Id $server.ProcessId
-        Wait-Process -Id $server.ProcessId -Timeout 10 -ErrorAction SilentlyContinue
+        $process=Get-Process -Id $server.ProcessId
+        $null=Invoke-RestMethod "$url/api/shutdown" -Method Post -TimeoutSec 5
+        if(!$process.WaitForExit(10000)){
+            $current=Get-CimInstance Win32_Process -Filter "ProcessId = $($server.ProcessId)"
+            if($current -and $current.CreationDate -ne $server.CreationDate){throw 'Server identity changed; refusing to stop.'}
+            if($current){
+                Stop-Process -Id $server.ProcessId
+                Wait-Process -Id $server.ProcessId -Timeout 10 -ErrorAction SilentlyContinue
+            }
+        }
         Remove-Item -LiteralPath $pidFile -ErrorAction SilentlyContinue
         Write-Host 'Stack stopped. Remote worker processes were left running.'
     }

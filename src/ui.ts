@@ -18,6 +18,7 @@ export interface BoardData {
   deps: Record<number, { on: number[]; unmet: number[] }>;
   planningActive: boolean;
   paused: boolean;
+  draining: boolean;
   activeRuns: { runId: number; taskId: number; agent: Agent }[];
 }
 export interface TaskData {
@@ -299,12 +300,12 @@ function header(data: BoardData): string {
   return `<div data-live="header"><header>
     <a class="brand" href="/" aria-label="Switchboard home"><img src="/logo.png" alt="Switchboard"></a>
     <h1><a href="/">SWITCHBOARD</a></h1>
-    ${data.paused
+    ${data.draining ? '<button disabled>Draining…</button>' : data.paused
       ? '<button onclick="api(\'/api/resume\')">▶ Resume dispatch</button>'
       : '<button class="danger" onclick="api(\'/api/pause\')">⏸ Pause dispatch</button>'}
     <span class="muted">${data.activeRuns.length ? data.activeRuns.map(r => `<span class="badge run">${esc(r.agent)} running #${r.taskId}</span>`).join(' ') : 'idle'}</span>
     <div class="meters">${AGENTS.map(a => meter(a, data.budgets[a], data.plan[a], data.agents[a])).join('')}</div>
-  </header>${data.paused ? '<div class="banner">Dispatch is paused — agents will not be launched.</div>' : ''}</div>`;
+  </header>${data.draining ? '<div class="banner">Dispatch is draining — the host stops when running jobs finish.</div>' : data.paused ? '<div class="banner">Dispatch is paused — agents will not be launched.</div>' : ''}</div>`;
 }
 
 function card(t: Task, projects: Project[], activeRuns: BoardData['activeRuns'], deps?: { on: number[]; unmet: number[] }): string {

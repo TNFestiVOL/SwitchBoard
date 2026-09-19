@@ -1,13 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import request from 'supertest';
 import express, { type Request, type Response } from 'express';
+import { EventEmitter } from 'node:events';
 import type { Server } from 'node:http';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { Store } from '../src/store.js';
 import { EventBus } from '../src/events.js';
 import { Dispatcher } from '../src/dispatcher.js';
-import { createApp, isLoopbackAddress, mcpLoopbackGuard } from '../src/server.js';
+import { attachListenerFailure, createApp, isLoopbackAddress, mcpLoopbackGuard } from '../src/server.js';
 import type { Launcher, RunResult } from '../src/launcher.js';
 
 class IdleLauncher implements Launcher {
@@ -74,15 +75,41 @@ describe('MCP loopback guard', () => {
   });
 });
 
+describe('listener failures', () => {
+  it.each([
+    ['board port 4680', 'EADDRINUSE'],
+    ['worker port 4781', 'EACCES'],
+    ['worker port 4781', 'ENOTFOUND'],
+  ])('logs %s and %s before exiting with code 1', (label, code) => {
+    const server = new EventEmitter() as Server;
+    const exit = vi.fn();
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      attachListenerFailure(server, label, exit);
+      server.emit('error', Object.assign(new Error('listen failed'), { code }));
+
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(log.mock.calls[0][0]).toContain(label);
+      expect(log.mock.calls[0][0]).toContain(code);
+      expect(exit).toHaveBeenCalledTimes(1);
+      expect(exit).toHaveBeenCalledWith(1);
+      expect(log.mock.invocationCallOrder[0]).toBeLessThan(exit.mock.invocationCallOrder[0]);
+    } finally {
+      log.mockRestore();
+    }
+  });
+});
+
 describe('server', () => {
   let store: Store;
   let app: ReturnType<typeof createApp>;
   let dispatcher: Dispatcher;
+  let bus: EventBus;
   let httpServer: Server | undefined;
 
   beforeEach(() => {
     store = new Store(':memory:');
-    const bus = new EventBus();
+    bus = new EventBus();
     dispatcher = new Dispatcher(store, new IdleLauncher(), bus, {
       budgets: { claude: { soft: 0, hard: 0 }, codex: { soft: 0, hard: 0 } },
       bounceCap: 6,
@@ -484,6 +511,80 @@ describe('server', () => {
     expect(store.getSetting('paused', '0')).toBe('0');
   });
 
+  it('drains dispatch by persisting both flags and reporting active runs', async () => {
+    store.createTask({ project_id: 1, title: 'Running job', description: '', assignee: 'claude', created_by: 'human', status: 'ready' });
+    dispatcher.tick();
+    expect(dispatcher.activeRuns()).toHaveLength(1);
+    const changes = vi.fn();
+    bus.onChange(changes);
+
+    const res = await request(app).post('/api/drain');
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ draining: true, paused: true, activeRuns: 1 });
+    expect(store.getSetting('paused', '')).toBe('1');
+    expect(store.getSetting('draining', '')).toBe('1');
+    expect(changes).toHaveBeenCalledTimes(1);
+    expect(changes).toHaveBeenCalledWith({ kind: 'draining' });
+  });
+
+  it('refuses resume while draining without changing settings or emitting events', async () => {
+    store.setSetting('paused', '1');
+    store.setSetting('draining', '1');
+    const changes = vi.fn();
+    bus.onChange(changes);
+
+    const res = await request(app).post('/api/resume');
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: 'host is draining; clear the drain before resuming' });
+    expect(store.getSetting('paused', '')).toBe('1');
+    expect(store.getSetting('draining', '')).toBe('1');
+    expect(changes).not.toHaveBeenCalled();
+  });
+
+  it('clears only the drain latch and requires explicit resume to dispatch', async () => {
+    store.setSetting('paused', '1');
+    store.setSetting('draining', '1');
+    const task = store.createTask({ project_id: 1, title: 'Waiting job', description: '', assignee: 'claude', created_by: 'human', status: 'ready' });
+    const changes = vi.fn();
+    bus.onChange(changes);
+
+    const res = await request(app).post('/api/drain/clear');
+
+    expect(res.status).toBe(200);
+    expect(store.getSetting('paused', '')).toBe('1');
+    expect(store.getSetting('draining', '')).toBe('0');
+    expect(changes).toHaveBeenCalledTimes(1);
+    expect(changes).toHaveBeenCalledWith({ kind: 'drain_cleared' });
+    dispatcher.tick();
+    expect(dispatcher.activeRuns()).toEqual([]);
+    expect(store.getTask(task.id)!.status).toBe('ready');
+
+    expect((await request(app).post('/api/resume')).status).toBe(200);
+    expect(store.getSetting('paused', '')).toBe('0');
+    expect(dispatcher.activeRuns()).toHaveLength(1);
+  });
+
+  it('reports the drain latch in state before, during, and after a drain', async () => {
+    expect((await request(app).get('/api/state')).body.draining).toBe(false);
+    await request(app).post('/api/drain');
+    expect((await request(app).get('/api/state')).body.draining).toBe(true);
+    await request(app).post('/api/drain/clear');
+    expect((await request(app).get('/api/state')).body.draining).toBe(false);
+  });
+
+  it('does not dispatch ready jobs while draining', async () => {
+    const task = store.createTask({ project_id: 1, title: 'Waiting job', description: '', assignee: 'claude', created_by: 'human', status: 'ready' });
+
+    const res = await request(app).post('/api/drain');
+    dispatcher.tick();
+
+    expect(dispatcher.activeRuns()).toEqual([]);
+    expect(store.getTask(task.id)!.status).toBe('ready');
+    expect(res.body).toEqual({ draining: true, paused: true, activeRuns: 0 });
+  });
+
   it('reports state with budgets and active runs', async () => {
     store.createTask({ project_id: 1, title: 'Run me', description: '', assignee: 'claude', created_by: 'human', status: 'ready' });
     dispatcher.tick();
@@ -493,6 +594,82 @@ describe('server', () => {
     expect(res.body.tasks).toHaveLength(1);
     expect(res.body.budgets.claude.level).toBe('ok');
     expect(res.body.activeRuns).toHaveLength(1);
+  });
+
+  it('rejects shutdown from a LAN socket even with loopback forwarding headers', async () => {
+    store.setSetting('paused', '1');
+    store.setSetting('draining', '1');
+    const shutdown = vi.fn(async () => {});
+    const lanApp = express();
+    lanApp.set('trust proxy', true);
+    lanApp.use((req, _res, next) => {
+      Object.defineProperty(req.socket, 'remoteAddress', { value: '192.0.2.20' });
+      next();
+    });
+    lanApp.use(createApp({ store, bus, dispatcher, shutdown }));
+
+    const res = await request(lanApp).post('/api/shutdown')
+      .set('X-Forwarded-For', '127.0.0.1').set('Forwarded', 'for="[::1]"');
+
+    expect(res.status).toBe(403);
+    expect(shutdown).not.toHaveBeenCalled();
+  });
+
+  it('refuses shutdown when paused without a drain latch', async () => {
+    store.setSetting('paused', '1');
+    const shutdown = vi.fn(async () => {});
+    const shutdownApp = createApp({ store, bus, dispatcher, shutdown });
+
+    const res = await request(shutdownApp).post('/api/shutdown');
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: expect.any(String), draining: false, activeRuns: 0 });
+    expect(shutdown).not.toHaveBeenCalled();
+  });
+
+  it('refuses shutdown while draining with an active run and reports its count', async () => {
+    store.createTask({ project_id: 1, title: 'Running job', description: '', assignee: 'claude', created_by: 'human', status: 'ready' });
+    dispatcher.tick();
+    await request(app).post('/api/drain');
+    const shutdown = vi.fn(async () => {});
+    const shutdownApp = createApp({ store, bus, dispatcher, shutdown });
+
+    const res = await request(shutdownApp).post('/api/shutdown');
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: expect.any(String), draining: true, activeRuns: 1 });
+    expect(dispatcher.activeRuns()).toHaveLength(1);
+    expect(shutdown).not.toHaveBeenCalled();
+  });
+
+  it('accepts idle drained shutdown and invokes it once after the response finishes', async () => {
+    await request(app).post('/api/drain');
+    const events: string[] = [];
+    const shutdown = vi.fn(async () => { events.push('shutdown'); });
+    const shutdownApp = express();
+    shutdownApp.use((_req, res, next) => {
+      res.once('finish', () => { events.push('response finished'); });
+      next();
+    });
+    shutdownApp.use(createApp({ store, bus, dispatcher, shutdown }));
+
+    const res = await request(shutdownApp).post('/api/shutdown');
+    await new Promise<void>(resolve => setImmediate(resolve));
+
+    expect(res.status).toBe(202);
+    expect(res.body).toEqual({ stopping: true });
+    expect(shutdown).toHaveBeenCalledTimes(1);
+    expect(events).toEqual(['response finished', 'shutdown']);
+  });
+
+  it('accepts idle drained shutdown when no shutdown callback is provided', async () => {
+    await request(app).post('/api/drain');
+
+    const res = await request(app).post('/api/shutdown');
+    await new Promise<void>(resolve => setImmediate(resolve));
+
+    expect(res.status).toBe(202);
+    expect(res.body).toEqual({ stopping: true });
   });
 
   it('serves live run output', async () => {
